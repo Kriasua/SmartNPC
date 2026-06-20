@@ -1,0 +1,29 @@
+# ===== Unreal Engine 生成目录(编译产物 / 缓存,不提交) =====
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# ===== IDE / 工程文件(本地生成) =====
+.vs/
+.idea/
+*.sln
+*.suo
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+# ===== Rider 自动安装的开发插件(本机生成,体积大) =====
+Plugins/Developer/RiderLink/
+
+# ===== 本地工具缓存 =====
+.codegraph/
+
+# ===== Agent 内部笔记(含个人信息,不提交) =====
+memory/
+
+# ===== 其它 =====
+*.tmp
+*.log
