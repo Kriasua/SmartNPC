@@ -21,6 +21,9 @@ Plugins/Developer/RiderLink/
 # ===== 本地工具缓存 =====
 .codegraph/
 
+# ===== 调试截图(本地参考,不提交) =====
+screenShots/
+
 # ===== Agent 内部笔记(含个人信息,不提交) =====
 memory/
 
