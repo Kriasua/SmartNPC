@@ -35,6 +35,21 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Patrol")
 	bool reverse = false;
 
+	// 激光从哪个骨骼插槽射出(在 Mesh 上建一个 Socket,比如猫眼/炮口)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attack|Laser")
+	FName MuzzleSocketName = TEXT("Muzzle");
+
+	// 激光最大射程
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attack|Laser")
+	float LaserRange = 2000.f;
+
+	// 命中一次造成的伤害
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attack|Laser")
+	float LaserDamage = 20.f;
+
+	// 命中检测(给 notify 调用)。
+	UFUNCTION(BlueprintCallable, Category = "Attack|Laser")
+	void FireLaser();
 
 
 };

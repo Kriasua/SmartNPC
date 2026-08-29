@@ -2,6 +2,9 @@
 
 
 #include "SteampunkCatNPC.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "DrawDebugHelpers.h"
 
 // Sets default values
 ASteampunkCatNPC::ASteampunkCatNPC()
@@ -30,5 +33,32 @@ void ASteampunkCatNPC::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
+}
+
+void ASteampunkCatNPC::FireLaser()
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (!MeshComp) return;
+
+
+	const FVector Start = MeshComp->GetSocketLocation(MuzzleSocketName);
+	const FVector End = Start + (GetActorForwardVector() * LaserRange);
+	
+	FHitResult Hit;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(this);
+	const bool bHit = GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+	
+	const FVector DrawEnd = bHit ? Hit.ImpactPoint : End;
+	DrawDebugLine(GetWorld(), Start, DrawEnd, bHit ? FColor::Red : FColor::Green,
+			false, 1.0f, 0, 1.5f);
+
+	
+	if (bHit && Hit.GetActor() && Hit.GetActor()->ActorHasTag(FName("Player")))
+	{
+		UGameplayStatics::ApplyPointDamage(
+				Hit.GetActor(), LaserDamage, (End - Start).GetSafeNormal(),
+				Hit, GetController(), this, UDamageType::StaticClass());
+	}
 }
 
