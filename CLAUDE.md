@@ -1,55 +1,75 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for agents working in this repository. Human-facing material lives in `README.md`
+(what it is, how to run it, demo) and `Docs/` (deep dives); keep the audiences separate.
 
-## Project
+UE **5.6** C++ project, single runtime module `SmartNPC`: an LLM chat brain (`UAIBrainComponent`)
+plus a traditional perception → blackboard → behavior-tree cat AI — two halves meant to become one
+agent.
 
-Unreal Engine **5.6** C++ project. A single runtime game module (`SmartNPC`) whose purpose is the `UAIBrainComponent` — an `ActorComponent` that gives an NPC a multi-turn LLM chat "brain" by calling an OpenAI-compatible chat/completions endpoint (default: Alibaba DashScope / Qwen) over HTTP.
+## Read scope — `.gitignore` is a hard boundary, not just hygiene
 
-Engine is bound via `EngineAssociation: "5.6"` in `SmartNPC.uproject`. The dev machine is Windows; paths and build commands below assume a standard `UE_5.6` install.
+**Never read, glob, or grep anything under:** `Intermediate/` `Binaries/` `Saved/`
+`DerivedDataCache/` `.vs/` `.idea/` `.codegraph/` `Plugins/Developer/RiderLink/`.
 
-## Build / run
+Macro-expanded UE build output (`.generated.h`, `.gen.cpp`) costs tens of thousands of tokens per
+file and says nothing `Source/` does not. `grep` honours `.gitignore`, but **`glob` does not** — a
+bare `*` or `**/*.h` walks ~13 GB of build output. Anchor glob patterns to a subdirectory
+(`Source/**/*.cpp`), never to the repo root, and never `read` a path a glob handed you. When
+delegating to a subagent, repeat this ban and give it only `Source/`, `Config/`,
+`Content/<subdir>/` or `Docs/` paths — never an open "explore the repo".
 
-There is no test suite, lint step, or CI. Build and run go through Unreal's tooling, not a generic compiler.
+`memory/` and `Docs/项目规划与求职路线.md` are gitignored personal notes: read them only when asked.
 
-Generate solution/project files after changing `.Build.cs`, `.Target.cs`, or adding source files:
-```powershell
-& "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" -projectfiles -project="C:\MyResearch\UE_Projects\SmartNPC\SmartNPC.uproject" -game -engine
-```
+## Non-negotiable invariants
 
-Build the editor target (most common during development):
+- **No credential may reach a serialized asset.** A key typed into a Details panel is saved into
+  placed-actor data under `Content/__ExternalActors__/**`; that is how one was committed here.
+  Keep key properties `Transient` and inject via `SMARTNPC_LLM_API_KEY` or the gitignored
+  `Config/LocalSecrets.ini`. Enforced by mechanism, not intention: `Tools/Check-ForSecrets.ps1`
+  (`-IncludeUntracked`, `-ScanHistory`, `-InstallHook`), installed with
+  `git config --local core.hooksPath Tools/githooks`. Deleting a file or a commit is **not** a fix
+  — revoke the key, because it stays in history.
+- `*.generated.h` is the **last** include in a header, and is never hand-edited.
+- Capture `this` in async work through `TWeakObjectPtr`; cancel in-flight HTTP in `EndPlay`.
+- Latent BTTasks keep per-execution state in `NodeMemory`, never in members: node instances are
+  shared by every NPC running the tree.
+- Follow the UE conventions the code already uses (`U`/`F`/`b` prefixes, `TEXT("...")`, `int32`).
+
+## Build
+
+No test suite / lint / CI — everything goes through Unreal's tooling. Regenerate project files after
+touching `.Build.cs`, `.Target.cs` or adding sources; the editor target is the usual one
+(`-projectfiles` and the `SmartNPC` game target: `README.md`):
+
 ```powershell
 & "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" SmartNPCEditor Win64 Development -project="C:\MyResearch\UE_Projects\SmartNPC\SmartNPC.uproject" -waitmutex
 ```
 
-Build the standalone game target:
-```powershell
-& "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" SmartNPC Win64 Development -project="C:\MyResearch\UE_Projects\SmartNPC\SmartNPC.uproject" -waitmutex
-```
+## Map — pointers only; the source is authoritative
 
-`SmartNPC.sln` (or the `.uproject` double-click → "Open with editor") also works. Targets: `SmartNPC` (Game) and `SmartNPCEditor` (Editor), defined in `Source/*.Target.cs`.
-
-## Architecture
-
-The module depends on `HTTP`, `Json`, and `JsonUtilities` (see `Source/SmartNPC/SmartNPC.Build.cs`) — these are the modules to keep in mind when touching the LLM code.
-
-Everything of substance lives in `UAIBrainComponent` (`Source/SmartNPC/Public/AIBrainComponent.h`, `Private/AIBrainComponent.cpp`). The flow:
-
-1. Blueprint calls `SendRequestToLLM(UserMessage)`. The component appends the user turn to in-memory `ConversationMessages`, builds the request JSON, and fires an async HTTP POST. `bLLMRequestInFlight` guards against concurrent requests; only one is in flight at a time.
-2. `OnLLMHttpComplete` parses the response. On success it appends the assistant turn, calls `TrimRecentTurns()` (keeps the last `MaxTurns * 2` messages), and broadcasts. On any failure it **pops the user turn it just added** so history stays consistent, then broadcasts an error.
-3. Results are always delivered via `BroadcastOnGameThread` → `OnLLMChatFinished` (a `BlueprintAssignable` delegate with `bool bSuccess, FString Message`). The marshal to the game thread exists because the HTTP callback may run off-thread; keep UI/Blueprint-facing work behind it.
-
-Conversation history is **in-memory only** (`TArray<FLLMChatMessage>`), reset by `ClearLLMConversation()` and not persisted across sessions. There is no system prompt and requests are non-streaming (`stream: false`) by design — adding either means changing only the JSON-building / parsing sections of the `.cpp`, not the Blueprint pins.
-
-Configuration is exposed as `UPROPERTY` fields editable in the editor Details panel under category `AI_System|LLM`: `LLM_BaseUrl` (no trailing `/chat/completions` — that's appended in code), `LLM_API_Key` (empty by default; set it in the editor, don't commit it), `LLM_Model`, and `MaxTurns`.
-
-## Conventions
-
-- Follow Unreal C++ conventions already in the code: `U`-prefixed `UObject` classes, `F`-prefixed structs, `b`-prefixed bools, `UPROPERTY`/`UFUNCTION`/`USTRUCT` reflection macros, `TEXT("...")` for string literals, `int32`/`FString`/`TArray`.
-- `AIBrainComponent.generated.h` must be the **last** include in the header. Never hand-edit `*.generated.h`.
-- Use UE smart pointers (`TSharedPtr`/`TSharedRef`, `MakeShared`) and `TWeakObjectPtr` when capturing `this` into async lambdas (as `BroadcastOnGameThread` does) to avoid dangling references after component destruction.
-- Cancel/unbind any in-flight HTTP request in `EndPlay` (the component already does this) when adding new async work.
+- **LLM brain** `Source/SmartNPC/{Public,Private}/AIBrainComponent.*`: appends the user turn, POSTs
+  chat/completions, pops that turn again on *any* failure, trims to `MaxTurns*2`, and always replies
+  through `BroadcastOnGameThread` → `OnLLMChatFinished`. History is in-memory only, with no system
+  prompt and no streaming — all by design. The key is resolved per request by `GetLLMAPIKey()`
+  (env var → gitignored ini → `SetLLMAPIKey()`), never from a serialized property.
+- **Steampunk-cat AI**: `SteampuckCatAIController.*` (perception writes blackboard facts only; the
+  misspelled name is the real class name), `SteampunkCatNPC.*` (pawn, patrol points, `FireLaser()`),
+  `FindSearchPoint` / `BTTask_SetPatrolLocation` / `BTTask_SetStillPatrolPointLoc` /
+  `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage notify → `FireLaser()`).
+  Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`,
+  `TargetLocation`, `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}`
+  (spelling as-is) and `Content/Sabertooth/`.
+- Module dependencies: `Source/SmartNPC/SmartNPC.Build.cs`. Everything else: read the sources.
+- New BTTasks belong to the same runtime module (`Public/` + `Private/`), then regenerate projects.
+- `Content/` is mostly third-party (Epic's `Factory_LP`, the store's `Sabertooth`): never describe
+  it as this project's own art.
 
 ## Docs
 
-`Docs/AIBrainComponent详解.md` is a detailed line-by-line walkthrough of `UAIBrainComponent` (in Chinese) aimed at readers new to UE C++. If you change the component's source, keep that doc in sync — source is authoritative.
+`Docs/项目现状与路线图.md` is the **current-state and roadmap entry point**: what is done, which
+directions were decided or rejected (and why), the M1/M2 plan, and the outstanding P0 items. Read it
+before proposing work — it exists to stop settled decisions from being re-litigated.
+
+`Docs/AIBrainComponent详解.md` walks the component line by line (Chinese) — keep it in sync when the
+component changes, source wins. No equivalent exists yet for the cat AI; the source is the reference.

@@ -10,10 +10,10 @@ SmartNPC 是一个 UE 5.6 C++ 项目，目标是打造**有记忆、有性格、
 ## ✨ 已实现功能
 
 ### 🤖 LLM 对话大脑（`UAIBrainComponent`）
-- 多轮对话，调用 OpenAI 兼容的 `chat/completions` 接口（默认 Alibaba DashScope / Qwen）
+- 多轮对话，调用 OpenAI 兼容的 `chat/completions` 接口（默认 DeepSeek，模型 `deepseek-flash`）
 - 异步 HTTP 请求，回调经 `BroadcastOnGameThread` 安全地回到游戏线程
 - 对话历史管理与轮次裁剪（`MaxTurns`）
-- `BaseUrl / Model / API Key / MaxTurns` 均在编辑器 Details 面板可配
+- `BaseUrl / Model / MaxTurns` 在编辑器 Details 面板可配；**API Key 不走面板**（见下方构建一节的密钥说明）
 
 ### 🐈 SteampunkCat 智能 NPC（传统游戏 AI）
 基于 **感知 → 黑板 → 行为树** 的经典架构：
@@ -85,7 +85,11 @@ UE 5.6 · C++ · Behavior Tree · Blackboard · AI Perception · NavMesh
 & "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" SmartNPCEditor Win64 Development -project="<路径>\SmartNPC.uproject" -waitmutex
 ```
 
-> 配置 `LLM_API_Key` 请在编辑器 Details 面板填写，**不要提交到仓库**。
+> **不要把 API Key 填进编辑器 Details 面板**。放在关卡里的 Actor 会把组件属性序列化进
+> `Content/__ExternalActors__/**`，那样就进仓库了（本项目踩过一次）。Key 走两条不进仓库的路：
+> 环境变量 `SMARTNPC_LLM_API_KEY`，或把 `Config/LocalSecrets.ini.example` 复制成
+> `Config/LocalSecrets.ini`（已被 `.gitignore` 排除）。
+> 提交前自检：`pwsh -NoProfile -ExecutionPolicy Bypass -File Tools\Check-ForSecrets.ps1`
 
 ## 🗺️ Roadmap
 

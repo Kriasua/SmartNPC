@@ -7,6 +7,9 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Async/Async.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/ConfigCacheIni.h"
+#include "Misc/Paths.h"
 
 namespace
 {
@@ -23,6 +26,21 @@ FString NormalizeBaseUrl(const FString& InUrl)
 FString BuildChatCompletionsUrl(const FString& BaseUrl)
 {
 	return NormalizeBaseUrl(BaseUrl) + TEXT("/chat/completions");
+}
+
+/** Environment variables checked, in order, for the LLM API key.
+ *  SMARTNPC_LLM_API_KEY is provider-neutral and wins. DEEPSEEK_API_KEY is the name the
+ *  DeepSeek tooling uses. DASHSCOPE_API_KEY stays last only so an existing Qwen setup still
+ *  resolves — against DeepSeek a Qwen key yields HTTP 401, which is a visible, safe failure. */
+const TCHAR* GAPIKeyEnvVars[] = { TEXT("SMARTNPC_LLM_API_KEY"), TEXT("DEEPSEEK_API_KEY"), TEXT("DASHSCOPE_API_KEY") };
+
+/** Gitignored local file that may carry the key on a dev machine: <Project>/Config/LocalSecrets.ini */
+const TCHAR* GLocalSecretsSection = TEXT("SmartNPC");
+const TCHAR* GLocalSecretsKeyName = TEXT("LLM_API_Key");
+
+FString GetLocalSecretsFilePath()
+{
+	return FPaths::ProjectConfigDir() / TEXT("LocalSecrets.ini");
 }
 }
 
@@ -97,6 +115,49 @@ void UAIBrainComponent::BroadcastOnGameThread(bool bSuccess, const FString& Mess
 	});
 }
 
+FString UAIBrainComponent::GetLLMAPIKey() const
+{
+	// 1) Environment variable: the recommended source, and the only one that cannot be committed.
+	for (const TCHAR* VarName : GAPIKeyEnvVars)
+	{
+		const FString FromEnv = FPlatformMisc::GetEnvironmentVariable(VarName).TrimStartAndEnd();
+		if (!FromEnv.IsEmpty())
+		{
+			return FromEnv;
+		}
+	}
+
+	// 2) Config/LocalSecrets.ini — gitignored, so a key kept here never reaches the repository.
+	const FString SecretsFile = GetLocalSecretsFilePath();
+	if (FPaths::FileExists(SecretsFile))
+	{
+		// LoadFile returns void (see ConfigCacheIni.h): it merges the file into the config cache.
+		GConfig->LoadFile(SecretsFile);
+		FString FromIni;
+		if (GConfig->GetString(GLocalSecretsSection, GLocalSecretsKeyName, FromIni, SecretsFile))
+		{
+			FromIni.TrimStartAndEndInline();
+			if (!FromIni.IsEmpty())
+			{
+				return FromIni;
+			}
+		}
+	}
+
+	// 3) Transient runtime override (SetLLMAPIKey, or the legacy Blueprint pin).
+	return LLM_API_Key.TrimStartAndEnd();
+}
+
+void UAIBrainComponent::SetLLMAPIKey(const FString& InKey)
+{
+	LLM_API_Key = InKey.TrimStartAndEnd();
+}
+
+bool UAIBrainComponent::HasLLMAPIKey() const
+{
+	return !GetLLMAPIKey().IsEmpty();
+}
+
 void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 {
 	const FString Trimmed = UserMessage.TrimStartAndEnd();
@@ -106,9 +167,10 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 		return;
 	}
 
-	if (LLM_API_Key.TrimStartAndEnd().IsEmpty())
+	const FString APIKey = GetLLMAPIKey();
+	if (APIKey.IsEmpty())
 	{
-		BroadcastOnGameThread(false, TEXT("LLM_API_Key is not set."));
+		BroadcastOnGameThread(false, TEXT("No LLM API key. Set the SMARTNPC_LLM_API_KEY environment variable, fill Config/LocalSecrets.ini, or call SetLLMAPIKey()."));
 		return;
 	}
 
@@ -157,7 +219,7 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 	Req->SetVerb(TEXT("POST"));
 	Req->SetURL(BuildChatCompletionsUrl(LLM_BaseUrl));
 	Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *LLM_API_Key.TrimStartAndEnd()));
+	Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *APIKey));
 	Req->SetContentAsString(Body);
 	Req->OnProcessRequestComplete().BindUObject(this, &UAIBrainComponent::OnLLMHttpComplete);
 

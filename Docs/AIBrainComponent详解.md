@@ -169,12 +169,14 @@ public:
 
 ---
 
-### 第 36–48 行：LLM 相关配置
+### 第 36–51 行：LLM 相关配置
 
 ```cpp
-	/** DashScope OpenAI-compatible base URL (no trailing /chat/completions). */
+	/** OpenAI-compatible base URL (no trailing /chat/completions).
+	 *  DeepSeek default; the previous Qwen value was
+	 *  https://dashscope.aliyuncs.com/compatible-mode/v1. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
-	FString LLM_BaseUrl = TEXT("https://dashscope.aliyuncs.com/compatible-mode/v1");
+	FString LLM_BaseUrl = TEXT("https://api.deepseek.com");
 ```
 
 **文档注释 `/** */`**：会在某些 IDE 里悬浮提示。  
@@ -182,18 +184,37 @@ public:
 Base URL **不含** `/chat/completions`，拼接在 `.cpp` 里完成。
 
 ```cpp
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
+	/** LEGACY, and Transient on purpose: a key typed into the Details panel is no longer serialized,
+	 *  so it can never be saved into a level (Content/__ExternalActors__/**) or a Blueprint again.
+	 *  The real key is resolved per request by GetLLMAPIKey(). */
+	UPROPERTY(BlueprintReadWrite, Transient, Category = "AI_System|LLM", meta = (DeprecatedProperty, ...))
 	FString LLM_API_Key;
 ```
 
-API Key；**默认空**，需在编辑器里填，勿提交仓库。
+**这里踩过一次真实的坑，值得当反面教材。**
+
+原来它是 `EditAnywhere`（可序列化）。于是你在编辑器 Details 面板里填的那串 Key，会随**放在关卡里的
+Actor** 一起被序列化进 `Content/__ExternalActors__/**` —— 那个文件一提交，Key 就跟着泄漏了。
+
+三处改动堵住了它：
+
+1. **`Transient`**：该属性不再参与序列化，**物理上存不进**任何资产。安全不靠"记得别填"这种自觉。
+2. **`meta = (DeprecatedProperty, DeprecationMessage = ...)`**：蓝图里的旧节点仍能编译（不破坏既有
+   蓝图），但会提示已弃用。
+3. **真正的取值改走 `GetLLMAPIKey()`**（见下文「第 66–77 行」）：环境变量 → 被 gitignore 的
+   `Config/LocalSecrets.ini` → 运行时 `SetLLMAPIKey()`。
+
+> 一条工程常识：**删掉文件或删掉提交都不算修复**。Key 一旦进过 git 历史，就永久留在历史对象里——
+> 唯一真正的修复是去服务商后台**吊销/轮换**它。仓库里的 `Tools/Check-ForSecrets.ps1` 负责在提交前拦住这类内容。
 
 ```cpp
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
-	FString LLM_Model = TEXT("qwen-plus");
+	FString LLM_Model = TEXT("deepseek-flash");
 ```
 
-请求体里的 **`model`** 字段。
+请求体里的 **`model`** 字段。默认 `deepseek-flash`（DeepSeek-V4.1-Flash），更强的可选
+`deepseek-v4-pro`；旧的 `qwen-plus` 已随 provider 切换移除。**注意**：`deepseek-chat` /
+`deepseek-reasoner` 已于 2026-07-24 停用，填这两个名字会直接失败。
 
 ```cpp
 	/** Max completed user+assistant turns kept after each reply (matches Python MAX_TURNS). */
@@ -206,7 +227,7 @@ API Key；**默认空**，需在编辑器里填，勿提交仓库。
 
 ---
 
-### 第 50–51 行：蓝图事件
+### 第 53–54 行：蓝图事件
 
 ```cpp
 	UPROPERTY(BlueprintAssignable, Category = "AI_System|LLM")
@@ -218,7 +239,7 @@ API Key；**默认空**，需在编辑器里填，勿提交仓库。
 
 ---
 
-### 第 53–61 行：蓝图可调函数
+### 第 56–64 行：蓝图可调函数
 
 ```cpp
 	UFUNCTION(BlueprintCallable, Category = "AI_System")
@@ -243,7 +264,41 @@ API Key；**默认空**，需在编辑器里填，勿提交仓库。
 
 ---
 
-### 第 63–68 行：生命周期与 Tick
+### 第 66–77 行：密钥相关的三个函数
+
+```cpp
+	/** Resolves the key for each request, in order: SMARTNPC_LLM_API_KEY / DEEPSEEK_API_KEY
+	 *  environment variable -> gitignored Config/LocalSecrets.ini -> SetLLMAPIKey() override. */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
+	FString GetLLMAPIKey() const;
+```
+
+**每次请求现取**密钥，而不是启动时读一次。好处：改了环境变量或 `Config/LocalSecrets.ini` 之后
+**不用重启编辑器**，下一次请求就生效。
+
+```cpp
+	/** Runtime-only override. Never serialized, so it dies with the session. */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
+	void SetLLMAPIKey(const FString& InKey);
+```
+
+运行时临时设置，**只活在本次会话**（`Transient`，永远不会被存进 `.uasset`）。调试时方便，
+正式使用应走环境变量或本地 ini。
+
+```cpp
+	/** True when GetLLMAPIKey() would return something. Useful for gating calls from Blueprint. */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
+	bool HasLLMAPIKey() const;
+```
+
+给蓝图做"到底有没有 Key"的判断（例如没配就禁用发送按钮）。三个函数都标了
+**`BlueprintCallable`**，所以在蓝图里可以直接调用。
+
+> 为什么要把 Key 从 Details 面板赶出去？原因见上文「第 36–51 行」里 `LLM_API_Key` 那段。
+
+---
+
+### 第 79–84 行：生命周期与 Tick
 
 ```cpp
 protected:
@@ -267,7 +322,7 @@ public:
 
 ---
 
-### 第 70–77 行：仅 C++ 可见的成员
+### 第 86–93 行：仅 C++ 可见的成员
 
 ```cpp
 private:
@@ -310,7 +365,7 @@ HTTP 完成回调；**不是 `UFUNCTION`**，蓝图不能直接绑；由 **`Bind
 
 ## 三、`AIBrainComponent.cpp` 逐段说明
 
-### 第 2–9 行：包含实现所需头文件
+### 第 2–12 行：包含实现所需头文件
 
 ```cpp
 #include "AIBrainComponent.h"
@@ -345,9 +400,19 @@ HTTP 完成回调；**不是 `UFUNCTION`**，蓝图不能直接绑；由 **`Bind
 
 **`AsyncTask`**：把代码投递到指定线程（这里用 **游戏线程**）。
 
+```cpp
+#include "HAL/PlatformMisc.h"
+#include "Misc/ConfigCacheIni.h"
+#include "Misc/Paths.h"
+```
+
+密钥解析用的三个：读环境变量（**`FPlatformMisc::GetEnvironmentVariable`**）、把本地 ini 并进配置
+缓存（**`GConfig`** / **`FConfigCacheIni`**）、拼出工程 `Config/` 目录（**`FPaths::ProjectConfigDir`**）。
+详见下文「第 115–156 行」。
+
 ---
 
-### 第 11–27 行：匿名命名空间（文件内私有函数）
+### 第 14–42 行：匿名命名空间（文件内私有函数）
 
 ```cpp
 namespace
@@ -389,6 +454,25 @@ FString BuildChatCompletionsUrl(const FString& BaseUrl)
 拼出 OpenAI 兼容的聊天接口完整路径。
 
 ```cpp
+/** Environment variables checked, in order, for the LLM API key. */
+const TCHAR* GAPIKeyEnvVars[] = { TEXT("SMARTNPC_LLM_API_KEY"), TEXT("DEEPSEEK_API_KEY"), TEXT("DASHSCOPE_API_KEY") };
+
+/** Gitignored local file that may carry the key on a dev machine: <Project>/Config/LocalSecrets.ini */
+const TCHAR* GLocalSecretsSection = TEXT("SmartNPC");
+const TCHAR* GLocalSecretsKeyName = TEXT("LLM_API_Key");
+
+FString GetLocalSecretsFilePath()
+{
+	return FPaths::ProjectConfigDir() / TEXT("LocalSecrets.ini");
+}
+```
+
+密钥的**来源清单**：先查三个环境变量（本项目命名 → DeepSeek 官方变量名 → 旧阿里云变量名，保留它只为
+兼容已有配置），再查本地那个被 `.gitignore` 排除的 ini。`GetLocalSecretsFilePath()` 只负责拼路径
+（`FPaths::ProjectConfigDir()` 就是工程的 `Config/` 目录），**读值**在 `GetLLMAPIKey()` 里做。
+和上面两个函数一样，它们都只在本 `.cpp` 内可见。
+
+```cpp
 }
 ```
 
@@ -396,7 +480,7 @@ FString BuildChatCompletionsUrl(const FString& BaseUrl)
 
 ---
 
-### 第 29–32 行：构造函数
+### 第 44–47 行：构造函数
 
 ```cpp
 UAIBrainComponent::UAIBrainComponent()
@@ -409,7 +493,7 @@ UAIBrainComponent::UAIBrainComponent()
 
 ---
 
-### 第 34–42 行：`BeginPlay`
+### 第 49–57 行：`BeginPlay`
 
 ```cpp
 void UAIBrainComponent::BeginPlay()
@@ -435,7 +519,7 @@ void UAIBrainComponent::BeginPlay()
 
 ---
 
-### 第 44–55 行：`EndPlay`
+### 第 59–70 行：`EndPlay`
 
 ```cpp
 void UAIBrainComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -476,7 +560,7 @@ void UAIBrainComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 ---
 
-### 第 57–60 行：`TickComponent`
+### 第 72–75 行：`TickComponent`
 
 ```cpp
 void UAIBrainComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -489,7 +573,7 @@ void UAIBrainComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAct
 
 ---
 
-### 第 62–68 行：`TestAILogic`
+### 第 77–83 行：`TestAILogic`
 
 ```cpp
 void UAIBrainComponent::TestAILogic()
@@ -505,7 +589,7 @@ void UAIBrainComponent::TestAILogic()
 
 ---
 
-### 第 70–73 行：`ClearLLMConversation`
+### 第 85–88 行：`ClearLLMConversation`
 
 ```cpp
 void UAIBrainComponent::ClearLLMConversation()
@@ -518,7 +602,7 @@ void UAIBrainComponent::ClearLLMConversation()
 
 ---
 
-### 第 75–84 行：`TrimRecentTurns`
+### 第 90–99 行：`TrimRecentTurns`
 
 ```cpp
 void UAIBrainComponent::TrimRecentTurns()
@@ -547,7 +631,7 @@ void UAIBrainComponent::TrimRecentTurns()
 
 ---
 
-### 第 86–98 行：`BroadcastOnGameThread`
+### 第 101–113 行：`BroadcastOnGameThread`
 
 ```cpp
 void UAIBrainComponent::BroadcastOnGameThread(bool bSuccess, const FString& Message)
@@ -579,7 +663,72 @@ void UAIBrainComponent::BroadcastOnGameThread(bool bSuccess, const FString& Mess
 
 ---
 
-### 第 100–166 行：`SendRequestToLLM`（主流程）
+### 第 115–156 行：密钥解析（`GetLLMAPIKey` / `SetLLMAPIKey` / `HasLLMAPIKey`）
+
+```cpp
+FString UAIBrainComponent::GetLLMAPIKey() const
+{
+	// 1) Environment variable: the recommended source, and the only one that cannot be committed.
+	for (const TCHAR* VarName : GAPIKeyEnvVars)
+	{
+		const FString FromEnv = FPlatformMisc::GetEnvironmentVariable(VarName).TrimStartAndEnd();
+		if (!FromEnv.IsEmpty())
+		{
+			return FromEnv;
+		}
+	}
+```
+
+**按优先级返回第一个非空来源**，这里是第 1 优先：环境变量。
+`FPlatformMisc::GetEnvironmentVariable(名字)` 返回 `FString`，变量不存在时得到空串；
+`for (const TCHAR* VarName : GAPIKeyEnvVars)` 是 **范围 for**，逐个遍历那个常量数组。
+
+```cpp
+	const FString SecretsFile = GetLocalSecretsFilePath();
+	if (FPaths::FileExists(SecretsFile))
+	{
+		// LoadFile returns void (see ConfigCacheIni.h): it merges the file into the config cache.
+		GConfig->LoadFile(SecretsFile);
+		FString FromIni;
+		if (GConfig->GetString(GLocalSecretsSection, GLocalSecretsKeyName, FromIni, SecretsFile))
+```
+
+第 2 优先：本地那个**被 `.gitignore` 排除**的 `Config/LocalSecrets.ini`。
+`GConfig->LoadFile()` 把该文件并进配置缓存 —— 注意它**返回 `void`**；随后用四参版
+`GetString(段, 键, 输出, 文件名)` 取值（这个才返回 `bool`）。
+
+```cpp
+	// 3) Transient runtime override (SetLLMAPIKey, or the legacy Blueprint pin).
+	return LLM_API_Key.TrimStartAndEnd();
+}
+```
+
+第 3 优先：`SetLLMAPIKey()` 设的临时值（或旧蓝图节点设的值）。它是 `Transient`，**只活在本次运行**。
+
+```cpp
+void UAIBrainComponent::SetLLMAPIKey(const FString& InKey)
+{
+	LLM_API_Key = InKey.TrimStartAndEnd();
+}
+```
+
+```cpp
+bool UAIBrainComponent::HasLLMAPIKey() const
+{
+	return !GetLLMAPIKey().IsEmpty();
+}
+```
+
+对外只回答"能不能拿到 Key"，不暴露来源细节；蓝图可以用它做开关。
+
+> **这两处签名是查过的，不是猜的。** `GConfig->LoadFile()` 返回 `void`、四参 `GetString()` 返回
+> `bool`，来自引擎头文件 `Runtime/Core/Public/Misc/ConfigCacheIni.h`（第 1317 / 1322 行）。
+> 这类"看着像返回 bool"的 API 最容易写错，而 UE 编译一次要几分钟 ——
+> **先查头文件，比先编译便宜得多。**
+
+---
+
+### 第 158–225 行：`SendRequestToLLM`（主流程）
 
 ```cpp
 void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
@@ -595,14 +744,16 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 空输入直接失败提示；**不修改**历史。
 
 ```cpp
-	if (LLM_API_Key.TrimStartAndEnd().IsEmpty())
+	const FString APIKey = GetLLMAPIKey();
+	if (APIKey.IsEmpty())
 	{
-		BroadcastOnGameThread(false, TEXT("LLM_API_Key is not set."));
+		BroadcastOnGameThread(false, TEXT("No LLM API key. Set the SMARTNPC_LLM_API_KEY environment variable, fill Config/LocalSecrets.ini, or call SetLLMAPIKey()."));
 		return;
 	}
 ```
 
-无 Key 无法鉴权。
+**先解析一次、后面复用**：这里既做前置检查，也直接用于下面的鉴权头（不必重复解析）。
+无 Key 无法鉴权；错误提示会告诉使用者三条可用的注入路径。
 
 ```cpp
 	if (bLLMRequestInFlight)
@@ -679,11 +830,12 @@ UE 5.6 已无 **`SetHttpEnabled`**；若工程禁了 HTTP，只能提示并撤�
 	Req->SetVerb(TEXT("POST"));
 	Req->SetURL(BuildChatCompletionsUrl(LLM_BaseUrl));
 	Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *LLM_API_Key.TrimStartAndEnd()));
+	Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *APIKey));
 	Req->SetContentAsString(Body);
 ```
 
-标准 REST：**POST**、JSON、**Bearer** 鉴权。
+标准 REST：**POST**、JSON、**Bearer** 鉴权。这里用的是上面解析出的 `APIKey`，**不再直接读属性**
+—— 那个 `Transient` 属性只是最后一道兜底来源。
 
 ```cpp
 	Req->OnProcessRequestComplete().BindUObject(this, &UAIBrainComponent::OnLLMHttpComplete);
@@ -701,7 +853,7 @@ UE 5.6 已无 **`SetHttpEnabled`**；若工程禁了 HTTP，只能提示并撤�
 
 ---
 
-### 第 168–272 行：`OnLLMHttpComplete`（回调）
+### 第 227–331 行：`OnLLMHttpComplete`（回调）
 
 ```cpp
 void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)

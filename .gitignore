@@ -14,6 +14,7 @@ Saved/
 *.VC.opendb
 *.xcodeproj
 *.xcworkspace
+*.DotSettings.user
 
 # ===== Rider 自动安装的开发插件(本机生成,体积大) =====
 Plugins/Developer/RiderLink/
@@ -29,6 +30,9 @@ memory/
 
 # ===== 个人 / 求职内容(不进作品集仓库) =====
 Docs/项目规划与求职路线.md
+
+# ===== 本地密钥 / 凭据(严禁提交:Key 走环境变量,或下面这个被忽略的文件) =====
+/Config/LocalSecrets.ini
 
 # ===== 其它 =====
 *.tmp
