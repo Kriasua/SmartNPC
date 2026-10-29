@@ -46,13 +46,28 @@ touching `.Build.cs`, `.Target.cs` or adding sources; the editor target is the u
 & "C:\Program Files\Epic Games\UE_5.6\Engine\Build\BatchFiles\Build.bat" SmartNPCEditor Win64 Development -project="C:\MyResearch\UE_Projects\SmartNPC\SmartNPC.uproject" -waitmutex
 ```
 
+## Git — never commit or push on your own
+
+Do **not** run `git commit`, `git push`, `git rebase`, `git reset`, or any other command that
+creates or rewrites history unless the user explicitly asks for a commit in the current turn.
+Finished work stays in the working tree: report it as ready and let the user decide when to
+commit. `git add` is only part of an already-approved commit.
+
+(Standing instruction from the user, 2026-10-28: 「以后我叫你提交你才提交」.)
+
 ## Map — pointers only; the source is authoritative
 
 - **LLM brain** `Source/SmartNPC/{Public,Private}/AIBrainComponent.*`: appends the user turn, POSTs
-  chat/completions, pops that turn again on *any* failure, trims to `MaxTurns*2`, and always replies
-  through `BroadcastOnGameThread` → `OnLLMChatFinished`. History is in-memory only, with no system
-  prompt and no streaming — all by design. The key is resolved per request by `GetLLMAPIKey()`
-  (env var → gitignored ini → `SetLLMAPIKey()`), never from a serialized property.
+  chat/completions with a **system prompt**, pops that turn again on *any* failure, trims to
+  `MaxTurns*2`, and always replies through `BroadcastOnGameThread` → `OnLLMChatFinished`. The reply
+  is a strict JSON decision (`{action,speech}`, action ∈ `none|move_to|patrol`), parsed and
+  whitelisted by `ParseDecision()`; failures retry once with a nudge, then fall back to a visible
+  error. No streaming. The key is resolved per request by `GetLLMAPIKey()` (env var → gitignored
+  ini → `SetLLMAPIKey()`), never from a serialized property.
+  **Invariant learned the hard way:** assistant turns in `ConversationMessages` must store the
+  **raw JSON**, never the spoken line — a plain-text assistant turn combined with
+  `response_format=json_object` makes the model return whitespace only (17/20 requests). Reproduce
+  and re-test with `Tools/deepseek_probe.py`, which talks to the API with Unreal out of the way.
 - **Steampunk-cat AI**: `SteampuckCatAIController.*` (perception writes blackboard facts only; the
   misspelled name is the real class name), `SteampunkCatNPC.*` (pawn, patrol points, `FireLaser()`),
   `FindSearchPoint` / `BTTask_SetPatrolLocation` / `BTTask_SetStillPatrolPointLoc` /
@@ -60,6 +75,9 @@ touching `.Build.cs`, `.Target.cs` or adding sources; the editor target is the u
   Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`,
   `TargetLocation`, `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}`
   (spelling as-is) and `Content/Sabertooth/`.
+  The cat Blueprint actually placed in the level is
+  `Content/NPC/LittleCat/BluePrints/BP_SteampunkCatNPC.uasset` — a **same-named** asset exists under
+  `Content/Sabertooth/Blueprints/`, so check the asset path before editing either one.
 - Module dependencies: `Source/SmartNPC/SmartNPC.Build.cs`. Everything else: read the sources.
 - New BTTasks belong to the same runtime module (`Public/` + `Private/`), then regenerate projects.
 - `Content/` is mostly third-party (Epic's `Factory_LP`, the store's `Sabertooth`): never describe

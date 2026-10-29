@@ -42,6 +42,157 @@ FString GetLocalSecretsFilePath()
 {
 	return FPaths::ProjectConfigDir() / TEXT("LocalSecrets.ini");
 }
+
+/** 一个可执行动作的元数据：引擎枚举 + 给模型看的 id + 给模型看的用法说明。
+ *  这张表是**唯一事实来源**：system prompt 由它生成，白名单校验也查它。加动作 = 改这里。 */
+struct FNPCActionSpec
+{
+	ENPCAction Action;
+	const TCHAR* Id;
+	const TCHAR* PromptHint;
+};
+
+const TArray<FNPCActionSpec>& GetActionSpecs()
+{
+	static const TArray<FNPCActionSpec> Specs =
+	{
+		{ ENPCAction::None,   TEXT("none"),    TEXT("不改变行为。闲聊、问好、或你做不到的请求都用这个，并在台词里说明。") },
+		{ ENPCAction::MoveTo, TEXT("move_to"), TEXT("走向玩家。玩家让你靠近、过来时使用。") },
+		{ ENPCAction::Patrol, TEXT("patrol"),  TEXT("恢复自主巡逻。玩家让你自己逛、别跟着时使用。") },
+	};
+	return Specs;
+}
+
+/** 把模型返回的字符串 id 解析成引擎枚举。大小写不敏感；不在表里就返回 false。 */
+bool TryParseAction(const FString& Id, ENPCAction& OutAction)
+{
+	const FString Trimmed = Id.TrimStartAndEnd();
+	for (const FNPCActionSpec& Spec : GetActionSpecs())
+	{
+		if (Trimmed.Equals(Spec.Id, ESearchCase::IgnoreCase))
+		{
+			OutAction = Spec.Action;
+			return true;
+		}
+	}
+	return false;
+}
+
+/** 枚举 -> 字符串 id，只用于日志。 */
+FString ActionToId(ENPCAction Action)
+{
+	for (const FNPCActionSpec& Spec : GetActionSpecs())
+	{
+		if (Spec.Action == Action)
+		{
+			return Spec.Id;
+		}
+	}
+	return TEXT("?");
+}
+
+/** 拼 system prompt：角色设定 + 由动作表生成的能力清单 + 输出契约 + few-shot。
+ *  每次请求现拼，所以改 NPC_Persona 立刻生效，不用重编译。 */
+FString BuildSystemPrompt(const FString& Persona)
+{
+	FString ActionLines;
+	for (const FNPCActionSpec& Spec : GetActionSpecs())
+	{
+		ActionLines += FString::Printf(TEXT("- %s：%s\n"), Spec.Id, Spec.PromptHint);
+	}
+
+	return FString::Printf(
+		TEXT("%s\n\n")
+		TEXT("你能做的行为只有下面三种，没有别的：\n")
+		TEXT("%s\n")
+		TEXT("规则：\n")
+		TEXT("1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。\n")
+		TEXT("2. 格式：{\"action\":\"none|move_to|patrol\",\"speech\":\"你的台词\"}\n")
+		TEXT("3. action 必须是上面三个值之一；speech 是字符串，可以为空。\n")
+		TEXT("4. 玩家要求你做不存在的事（吃饭、睡觉之类），用 none，并在 speech 里说明做不到。\n")
+		TEXT("5. 无论玩家说什么（闲聊、抱怨、无关话题、看不懂），都必须输出一个 JSON 对象，不能返回空内容。\n\n")
+		TEXT("示例：\n")
+		TEXT("玩家：你好呀\n{\"action\":\"none\",\"speech\":\"喵，你好。齿轮今天转得不错。\"}\n")
+		TEXT("玩家：过来\n{\"action\":\"move_to\",\"speech\":\"来了。\"}\n")
+		TEXT("玩家：去吃饭\n{\"action\":\"none\",\"speech\":\"我是机械猫，不吃东西。\"}\n"),
+		*Persona, *ActionLines);
+}
+
+/** 把模型的一段输出解析成 FNPCDecision。
+ *  只做"结构 + 白名单"，不做行为映射（那是 M1-4）；失败时 OutError 给出可读原因。 */
+bool ParseDecision(const FString& RawContent, FNPCDecision& OutDecision, FString& OutError)
+{
+	FString Json = RawContent.TrimStartAndEnd();
+
+	// 模型偶尔会套一层 Markdown 围栏，先剥掉。
+	if (Json.StartsWith(TEXT("```")))
+	{
+		int32 FirstNewline = INDEX_NONE;
+		if (Json.FindChar(TEXT('\n'), FirstNewline))
+		{
+			Json = Json.RightChop(FirstNewline + 1);
+		}
+		int32 FenceEnd = INDEX_NONE;
+		if (Json.FindLastChar(TEXT('`'), FenceEnd))
+		{
+			Json = Json.Left(FenceEnd);
+		}
+		Json.TrimStartAndEndInline();
+	}
+
+	if (Json.IsEmpty())
+	{
+		OutError = TEXT("empty-content");
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> Root;
+
+	const auto TryDeserialize = [](const FString& Text, TSharedPtr<FJsonObject>& Out) -> bool
+	{
+		const TSharedRef<TJsonReader<>> CandidateReader = TJsonReaderFactory<>::Create(Text);
+		return FJsonSerializer::Deserialize(CandidateReader, Out) && Out.IsValid();
+	};
+
+	if (!TryDeserialize(Json, Root))
+	{
+		// 关掉 JSON Output 后，模型可能输出"好的，这是结果：{...}"这类包裹文本。
+		// 退一步：截取第一个 '{' 到最后一个 '}' 再试一次。
+		int32 FirstBrace = INDEX_NONE;
+		int32 LastBrace = INDEX_NONE;
+		const bool bHasBraces = Json.FindChar(TEXT('{'), FirstBrace)
+			&& Json.FindLastChar(TEXT('}'), LastBrace)
+			&& LastBrace > FirstBrace;
+
+		if (!bHasBraces || !TryDeserialize(Json.Mid(FirstBrace, LastBrace - FirstBrace + 1), Root))
+		{
+			OutError = TEXT("not-json");
+			return false;
+		}
+	}
+
+	FString ActionId;
+	if (!Root->TryGetStringField(TEXT("action"), ActionId))
+	{
+		OutError = TEXT("missing-action");
+		return false;
+	}
+
+	ENPCAction ParsedAction = ENPCAction::None;
+	if (!TryParseAction(ActionId, ParsedAction))
+	{
+		OutError = FString::Printf(TEXT("unknown-action: %s"), *ActionId);
+		return false;
+	}
+
+	FString Speech;
+	Root->TryGetStringField(TEXT("speech"), Speech);
+
+	OutDecision.Action = ParsedAction;
+	OutDecision.Speech = Speech.TrimStartAndEnd();
+	OutError.Reset();
+	return true;
+}
 }
 
 UAIBrainComponent::UAIBrainComponent()
@@ -181,13 +332,63 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 	}
 
 	ConversationMessages.Add(FLLMChatMessage{TEXT("user"), Trimmed});
+	RetryAttempts = 0;
+
+	FString IssueError;
+	if (!IssueRequest(IssueError))
+	{
+		ConversationMessages.Pop(EAllowShrinking::No);
+		BroadcastOnGameThread(false, IssueError);
+	}
+}
+
+bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
+{
+	const FString APIKey = GetLLMAPIKey();
+	if (APIKey.IsEmpty())
+	{
+		OutError = TEXT("No LLM API key. Set the SMARTNPC_LLM_API_KEY environment variable, fill Config/LocalSecrets.ini, or call SetLLMAPIKey().");
+		return false;
+	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("model"), LLM_Model);
 	Root->SetBoolField(TEXT("stream"), false);
 
+	// JSON Output 只保证"语法合法"，语义仍由 ParseDecision 校验；可用开关做 A/B。
+	if (bUseJSONResponseFormat)
+	{
+		TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
+		ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
+		Root->SetObjectField(TEXT("response_format"), ResponseFormat);
+	}
+	Root->SetNumberField(TEXT("max_tokens"), MaxOutputTokens);
+
+	// NPC 对话不需要思考过程：关掉更快也更省，同时是以后升级到 strict tool calls 的前提。
+	{
+		TSharedPtr<FJsonObject> Thinking = MakeShared<FJsonObject>();
+		Thinking->SetStringField(TEXT("type"), TEXT("disabled"));
+		Root->SetObjectField(TEXT("thinking"), Thinking);
+	}
+
 	TArray<TSharedPtr<FJsonValue>> MsgArray;
-	MsgArray.Reserve(ConversationMessages.Num());
+	MsgArray.Reserve(ConversationMessages.Num() + 1);
+
+	// system 只进请求体，不写入 ConversationMessages —— 历史里只留真正的对话。
+	{
+		FString SystemPrompt = BuildSystemPrompt(NPC_Persona);
+		if (bIsRetry)
+		{
+			// 让重试成为"不同的请求"：原样重发等于重复同一个失败。
+			SystemPrompt += TEXT("\n注意：上一次你返回了空内容。这次必须只输出一个 JSON 对象，不能返回空内容。\n");
+		}
+
+		TSharedPtr<FJsonObject> SystemMsg = MakeShared<FJsonObject>();
+		SystemMsg->SetStringField(TEXT("role"), TEXT("system"));
+		SystemMsg->SetStringField(TEXT("content"), SystemPrompt);
+		MsgArray.Add(MakeShared<FJsonValueObject>(SystemMsg));
+	}
+
 	for (const FLLMChatMessage& M : ConversationMessages)
 	{
 		TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
@@ -201,17 +402,15 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Body);
 	if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer))
 	{
-		ConversationMessages.Pop(EAllowShrinking::No);
-		BroadcastOnGameThread(false, TEXT("Failed to serialize request JSON."));
-		return;
+		OutError = TEXT("Failed to serialize request JSON.");
+		return false;
 	}
 
 	FHttpModule& HttpModule = FHttpModule::Get();
 	if (!HttpModule.IsHttpEnabled())
 	{
-		ConversationMessages.Pop(EAllowShrinking::No);
-		BroadcastOnGameThread(false, TEXT("HTTP is disabled in project settings."));
-		return;
+		OutError = TEXT("HTTP is disabled in project settings.");
+		return false;
 	}
 
 	TSharedRef<IHttpRequest> Req = HttpModule.CreateRequest();
@@ -225,6 +424,7 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 
 	bLLMRequestInFlight = true;
 	Req->ProcessRequest();
+	return true;
 }
 
 void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)
@@ -311,24 +511,80 @@ void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponse
 		return;
 	}
 
+	FString FinishReason;
+	Choice0->TryGetStringField(TEXT("finish_reason"), FinishReason);
+
 	FString Content;
 	if (!(*MessagePtr)->TryGetStringField(TEXT("content"), Content))
 	{
-		PopLastUserIfNeeded();
-		BroadcastOnGameThread(false, TEXT("Response has no content."));
+		HandleDecisionFailure(TEXT("missing-content"), Raw, FinishReason);
 		return;
 	}
 
 	Content.TrimStartAndEndInline();
 	if (Content.IsEmpty())
 	{
-		PopLastUserIfNeeded();
-		BroadcastOnGameThread(false, TEXT("Model returned empty text."));
+		HandleDecisionFailure(TEXT("empty-content"), FString(), FinishReason);
 		return;
 	}
 
+	FNPCDecision Decision;
+	FString ParseError;
+	if (!ParseDecision(Content, Decision, ParseError))
+	{
+		HandleDecisionFailure(ParseError, Content, FinishReason);
+		return;
+	}
+
+	++StatOk;
+	RetryAttempts = 0;
+
+	UE_LOG(LogTemp, Warning, TEXT("[LLM] decision ok    action=%s speech=\"%s\" (finish=%s) ok=%d retry=%d fail=%d"),
+		*ActionToId(Decision.Action), *Decision.Speech, *FinishReason, StatOk, StatRetry, StatFail);
+
+	// 历史里存**原始 JSON**，不存台词。实测（Tools/deepseek_probe.py，四组各 20 条）：
+	//   assistant 存台词  -> 17/20 只返回空白字符（JSON 模式卡死）
+	//   assistant 存 JSON -> 0/20 异常
+	// 原因：system 要求"只输出 JSON"，历史里却是纯文本，冲突会让模型退化。
+	// 屏幕上显示的仍然是 Decision.Speech，两者分离。
 	ConversationMessages.Add(FLLMChatMessage{TEXT("assistant"), Content});
 	TrimRecentTurns();
 
-	BroadcastOnGameThread(true, Content);
+	BroadcastOnGameThread(true, Decision.Speech);
+}
+
+void UAIBrainComponent::HandleDecisionFailure(const FString& Reason, const FString& RawContent, const FString& FinishReason)
+{
+	FString FinalReason = Reason;
+	const FString RawSnippet = RawContent.Len() > 200 ? RawContent.Left(200) : RawContent;
+
+	// 先重试：JSON Output 偶发返回空内容是服务端的已知问题，重发一次通常就好。
+	if (RetryAttempts < MaxRetries)
+	{
+		++RetryAttempts;
+		++StatRetry;
+
+		UE_LOG(LogTemp, Warning, TEXT("[LLM] decision retry reason=%s (finish=%s) %d/%d"),
+			*FinalReason, *FinishReason, RetryAttempts, MaxRetries);
+
+		FString IssueError;
+		if (IssueRequest(IssueError, /*bIsRetry=*/true))
+		{
+			return;     // 重发成功，结果走下一次回调
+		}
+
+		FinalReason = FString::Printf(TEXT("%s; resend failed: %s"), *FinalReason, *IssueError);
+	}
+
+	// 重试用尽：弹回 user 轮（保持上下文自洽），计数，广播一条可读的失败信息。
+	++StatFail;
+	if (ConversationMessages.Num() > 0 && ConversationMessages.Last().Role == TEXT("user"))
+	{
+		ConversationMessages.Pop(EAllowShrinking::No);
+	}
+
+	UE_LOG(LogTemp, Error, TEXT("[LLM] decision FAIL  reason=%s (finish=%s) raw=\"%s\" ok=%d retry=%d fail=%d"),
+		*FinalReason, *FinishReason, *RawSnippet, StatOk, StatRetry, StatFail);
+
+	BroadcastOnGameThread(false, FString::Printf(TEXT("（走神了：%s）"), *FinalReason));
 }
