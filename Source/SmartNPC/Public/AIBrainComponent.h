@@ -10,6 +10,10 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnLLMChatFinished, bool, bSuccess, FString, Message);
 
+/** M1-4 调试开关：控制台 `SmartNPC.Mode 0|1`（0 = 原生感知驱动，1 = LLM 决策）。
+ *  定义在 AIBrainComponent.cpp；感知侧与决策侧都读它，保证同一时刻只有一个写入者。 */
+SMARTNPC_API bool IsLLMModeEnabled();
+
 USTRUCT(BlueprintType)
 struct FLLMChatMessage
 {
@@ -31,7 +35,7 @@ enum class ENPCAction : uint8
 	Patrol  UMETA(DisplayName = "Patrol"),
 };
 
-/** M1-2: 一次决策的解析结果。M1-4 会让它随 OnNPCDecision 广播进蓝图。 */
+/** M1-2: 一次决策的解析结果。M1-4 起随 OnNPCDecision 广播给行为层。 */
 USTRUCT(BlueprintType)
 struct FNPCDecision
 {
@@ -44,6 +48,9 @@ struct FNPCDecision
 	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
 	FString Speech;
 };
+
+/** M1-4：通过校验的决策出口。控制器订阅它去写黑板。 */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnNPCDecision, FNPCDecision, Decision);
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class SMARTNPC_API UAIBrainComponent : public UActorComponent
@@ -97,6 +104,10 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "AI_System|LLM")
 	FOnLLMChatFinished OnLLMChatFinished;
+
+	/** M1-4：结构化决策出口。旧的 OnLLMChatFinished 保持不变，蓝图无需改动。 */
+	UPROPERTY(BlueprintAssignable, Category = "AI_System|LLM")
+	FOnNPCDecision OnNPCDecision;
 
 	UFUNCTION(BlueprintCallable, Category = "AI_System")
 	void TestAILogic();

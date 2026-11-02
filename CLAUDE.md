@@ -62,19 +62,27 @@ commit. `git add` is only part of an already-approved commit.
   `MaxTurns*2`, and always replies through `BroadcastOnGameThread` → `OnLLMChatFinished`. The reply
   is a strict JSON decision (`{action,speech}`, action ∈ `none|move_to|patrol`), parsed and
   whitelisted by `ParseDecision()`; failures retry once with a nudge, then fall back to a visible
-  error. No streaming. The key is resolved per request by `GetLLMAPIKey()` (env var → gitignored
-  ini → `SetLLMAPIKey()`), never from a serialized property.
+  error. No streaming. Valid decisions leave through `OnNPCDecision` (structured) and
+  `OnLLMChatFinished` (speech text). The key is resolved per request by `GetLLMAPIKey()` (env var →
+  gitignored ini → `SetLLMAPIKey()`), never from a serialized property.
   **Invariant learned the hard way:** assistant turns in `ConversationMessages` must store the
   **raw JSON**, never the spoken line — a plain-text assistant turn combined with
   `response_format=json_object` makes the model return whitespace only (17/20 requests). Reproduce
   and re-test with `Tools/deepseek_probe.py`, which talks to the API with Unreal out of the way.
 - **Steampunk-cat AI**: `SteampuckCatAIController.*` (perception writes blackboard facts only; the
-  misspelled name is the real class name), `SteampunkCatNPC.*` (pawn, patrol points, `FireLaser()`),
-  `FindSearchPoint` / `BTTask_SetPatrolLocation` / `BTTask_SetStillPatrolPointLoc` /
+  misspelled name is the real class name), `SteampunkCatNPC.*` (pawn, patrol points, `FireLaser()`,
+  speech bubble), `FindSearchPoint` / `BTTask_SetPatrolLocation` / `BTTask_SetStillPatrolPointLoc` /
   `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage notify → `FireLaser()`).
   Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`,
   `TargetLocation`, `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}`
   (spelling as-is) and `Content/Sabertooth/`.
+  **Two drive modes**, switched at runtime with the `SmartNPC.Mode` cvar (defined in
+  `AIBrainComponent.cpp`): `0` = perception drives the blackboard, `1` = the LLM decision does and
+  perception is muted. The arbiter is `ApplyDecisionToBlackboard()` — M1-5 belongs there.
+  Known debt: in LLM mode `IsPlayerInSight` doubles as the "should chase" control bit, because the
+  behaviour tree's top-level gate is that key.
+  The speech bubble is a world-space `WidgetComponent` created in `ASteampunkCatNPC`; the widget
+  asset is `Content/UI/WBP_BubbleSpeech` and its text block **must be named `SpeechText`**.
   The cat Blueprint actually placed in the level is
   `Content/NPC/LittleCat/BluePrints/BP_SteampunkCatNPC.uasset` — a **same-named** asset exists under
   `Content/Sabertooth/Blueprints/`, so check the asset path before editing either one.

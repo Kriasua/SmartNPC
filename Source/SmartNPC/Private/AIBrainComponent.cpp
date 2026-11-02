@@ -8,8 +8,22 @@
 #include "Serialization/JsonWriter.h"
 #include "Async/Async.h"
 #include "HAL/PlatformMisc.h"
+#include "HAL/IConsoleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
+
+/** M1-4 调试开关。0 = 原生感知驱动（感知写黑板）；1 = LLM 决策驱动（感知静音）。
+ *  用 cvar 而不是 UPROPERTY，是为了能在 PIE 中随时用控制台切换、不用重编译。 */
+static TAutoConsoleVariable<int32> CVarSmartNPCMode(
+	TEXT("SmartNPC.Mode"),
+	0,
+	TEXT("0 = native AI (perception drives the cat)   1 = LLM decisions"),
+	ECVF_Default);
+
+bool IsLLMModeEnabled()
+{
+	return CVarSmartNPCMode.GetValueOnGameThread() != 0;
+}
 
 namespace
 {
@@ -541,14 +555,13 @@ void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponse
 
 	UE_LOG(LogTemp, Warning, TEXT("[LLM] decision ok    action=%s speech=\"%s\" (finish=%s) ok=%d retry=%d fail=%d"),
 		*ActionToId(Decision.Action), *Decision.Speech, *FinishReason, StatOk, StatRetry, StatFail);
-
-	// 历史里存**原始 JSON**，不存台词。实测（Tools/deepseek_probe.py，四组各 20 条）：
-	//   assistant 存台词  -> 17/20 只返回空白字符（JSON 模式卡死）
-	//   assistant 存 JSON -> 0/20 异常
-	// 原因：system 要求"只输出 JSON"，历史里却是纯文本，冲突会让模型退化。
-	// 屏幕上显示的仍然是 Decision.Speech，两者分离。
+	
 	ConversationMessages.Add(FLLMChatMessage{TEXT("assistant"), Content});
 	TrimRecentTurns();
+
+	// M1-4：先给行为层（控制器写黑板），再给 UI（蓝图里的打印）。
+	// 两者都在游戏线程，直接广播即可，不必再走 BroadcastOnGameThread。
+	OnNPCDecision.Broadcast(Decision);
 
 	BroadcastOnGameThread(true, Decision.Speech);
 }
