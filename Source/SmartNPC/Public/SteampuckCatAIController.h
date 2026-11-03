@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "AIController.h"
 #include "AIBrainComponent.h"
+#include "NPCActionRegistry.h"
 #include "Perception/AIPerceptionComponent.h"
 #include "Perception/AISenseConfig_Prediction.h"
 #include "Perception/AISenseConfig_Sight.h"
@@ -13,31 +14,38 @@
 class UBlackboardComponent;
 
 /**
- * 猫的 AI 控制器。
+ * 友方机械猫的 AI 控制器。
  *
- * 两种驱动模式（控制台 `SmartNPC.Mode 0|1` 切换）：
- *   0 = 原生：感知回调把事实（看得见 / 丢失位置）写进黑板，行为树据此决策。
- *   1 = LLM ：感知回调静音，改由 Pawn 上 UAIBrainComponent 的 OnNPCDecision 驱动黑板。
- * 同一时刻只有一个写入者，所以两套逻辑不会互相覆盖。
+ * 三层结构：
+ *   1. 默认状态机   —— 按玩家距离决定"跟随 / 自主巡逻"（含滞回）
+ *   2. LLM 意图     —— 覆盖默认状态；有终点的 goal 由条件判定完成，无终点的 mode 持续生效
+ *   3. 感知         —— 只写事实（IsPlayerInSight / LastKnownLocation），不写行为状态
  *
- * 技术债（M1-4）：LLM 模式下 IsPlayerInSight 被当作"要追吗"的控制位使用，而行为树第一层
- * 门正是它。M1-5 会引入衍生键（如 bShouldChase）并把仲裁收敛到 ApplyDecisionToBlackboard 一处。
+ * 切换与仲裁：`SmartNPC.Mode 0|1` 决定是否接受 LLM 决策。同一时刻只有一个写入者，
+ * 所以两套逻辑不会互相覆盖。
  */
 UCLASS()
 class SMARTNPC_API ASteampuckCatAIController : public AAIController
 {
 	GENERATED_BODY()
-	
+
 public:
 	ASteampuckCatAIController();
 
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void OnUnPossess() override;
 	virtual void Tick(float DeltaSeconds) override;
-	
+
+	// ---- 供动作注册表（NPCActionRegistry）调用的执行与判定 ----
+	// 参数名刻意避开 "Blackboard"：AAIController 有同名成员，局部同名会触发 C4458（警告即错误）。
+	bool ApplyNoneAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
+	bool ApplyMoveToAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
+	bool ApplyPatrolAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
+	bool IsMoveToComplete(const FActiveGoal& Goal) const;
+
 protected:
 	virtual void BeginPlay() override;
-	
+
 	// 感知组件本体
 	UPROPERTY(VisibleAnywhere, Category = "AI|Perception")
 	UAIPerceptionComponent* AIPerceptionComp;
@@ -45,11 +53,29 @@ protected:
 	// 视觉感知配置
 	UPROPERTY(VisibleAnywhere, Category = "AI|Perception")
 	UAISenseConfig_Sight* SightConfig;
-	
+
 	// 预感感知配置
 	UPROPERTY(VisibleAnywhere, Category = "AI|Perception")
 	UAISenseConfig_Prediction* PredictionConfig;
-	
+
+	// ---- 行为参数（蓝图可调，不用改代码） ----
+
+	/** 目标动作的到达半径：走进这个距离就算 move_to 完成。 */
+	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
+	float ArriveRadius = 250.f;
+
+	/** 玩家进入这个距离 -> 开始跟随（默认状态机）。 */
+	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
+	float FollowEnterRadius = 600.f;
+
+	/** 玩家离开这个距离 -> 停止跟随。与 Enter 拉开距离形成滞回，避免抖动。 */
+	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
+	float FollowExitRadius = 900.f;
+
+	/** 兜底：goal 超过这个时间仍未完成就放弃（异常路径，不是"意图有效期"）。 */
+	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "1"))
+	float WatchdogSeconds = 60.f;
+
 	UFUNCTION()
 	void onTargetPerceptionUpdated(AActor* UpdatedActor, FAIStimulus Stimulus);
 
@@ -57,17 +83,29 @@ protected:
 	UFUNCTION()
 	void HandleLLMDecision(FNPCDecision Decision);
 
-	/** 把决策翻译成黑板键。M1-5 的优先级仲裁也将加在这里。 */
-	void ApplyDecisionToBlackboard(const FNPCDecision& Decision);
-
-	/** 从黑板键自己的枚举定义里按名字取数值，避免把 0/1 硬编码进代码。 */
-	static bool ResolveBehaviourValue(UBlackboardComponent* Blackboard, const TCHAR* ValueName, uint8& OutValue);
-
-	/** 模式切换时清理黑板，避免上一模式留下的脏值卡住行为树。 */
-	void ResetBlackboardForModeSwitch();
+	/** 从黑板键的枚举定义里按名字取数值，避免把 0/1 硬编码进代码。 */
+	static bool ResolveBehaviourValue(UBlackboardComponent* BlackboardComp, const TCHAR* ValueName, uint8& OutValue);
 
 private:
+	/** 当前谁在驾驶：无（默认状态机）/ 目标 / 模式。 */
+	enum class EHold : uint8
+	{
+		None,
+		Goal,
+		Mode,
+	};
+
+	void UpdateDefaultState();
+	void FinishGoal(const TCHAR* Reason);
+	void ResetBlackboardToNative();
+
+	APawn* GetPlayerPawn() const;
+	float DistanceToPlayer() const;
+
 	TWeakObjectPtr<UAIBrainComponent> Brain;
+
+	EHold Hold = EHold::None;
+	FActiveGoal ActiveGoal;
 
 	/** 上一次看到的模式值，用于检测切换。 */
 	bool bLastLLMMode = false;

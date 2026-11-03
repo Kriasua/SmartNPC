@@ -69,18 +69,29 @@ commit. `git add` is only part of an already-approved commit.
   **raw JSON**, never the spoken line — a plain-text assistant turn combined with
   `response_format=json_object` makes the model return whitespace only (17/20 requests). Reproduce
   and re-test with `Tools/deepseek_probe.py`, which talks to the API with Unreal out of the way.
-- **Steampunk-cat AI**: `SteampuckCatAIController.*` (perception writes blackboard facts only; the
-  misspelled name is the real class name), `SteampunkCatNPC.*` (pawn, patrol points, `FireLaser()`,
-  speech bubble), `FindSearchPoint` / `BTTask_SetPatrolLocation` / `BTTask_SetStillPatrolPointLoc` /
-  `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage notify → `FireLaser()`).
-  Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`,
-  `TargetLocation`, `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}`
-  (spelling as-is) and `Content/Sabertooth/`.
+- **Steampunk-cat AI** (now a **friendly companion**, not the old enemy template):
+  `SteampuckCatAIController.*` (perception writes facts only — `IsPlayerInSight` / `LastKnownLocation`,
+  never behaviour state; the misspelled name is the real class name), `SteampunkCatNPC.*` (pawn,
+  patrol points, `FireLaser()`, speech bubble), `FindSearchPoint` / `BTTask_SetPatrolLocation` /
+  `BTTask_SetStillPatrolPointLoc` / `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage
+  notify → `FireLaser()`). Blackboard keys: `IsPlayerInSight`, `bShouldFollow` (the behaviour tree's
+  top-level gate), `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`, `TargetLocation`,
+  `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}` (spelling as-is).
+  **Who drives what:** a default state machine decides follow (player within 600) vs patrol (beyond
+  900, hysteresis), and an accepted LLM intent overrides it. Intents come in two kinds — **goal**
+  (`move_to`: completed by a predicate, e.g. within `ArriveRadius`) and **mode** (`patrol`: no end,
+  persists until replaced). A 60 s watchdog only guards against getting stuck. The finished goal's
+  outcome is fed back into the next request's system prompt, so the model knows whether its last
+  command worked.
+  **Action registry**: `Source/SmartNPC/{Public,Private}/NPCActionRegistry.*` is the single source of
+  truth for prompt lines, the whitelist, execution and completion checks — adding an action = one row
+  plus one handler on the controller.
   **Two drive modes**, switched at runtime with the `SmartNPC.Mode` cvar (defined in
-  `AIBrainComponent.cpp`): `0` = perception drives the blackboard, `1` = the LLM decision does and
-  perception is muted. The arbiter is `ApplyDecisionToBlackboard()` — M1-5 belongs there.
-  Known debt: in LLM mode `IsPlayerInSight` doubles as the "should chase" control bit, because the
-  behaviour tree's top-level gate is that key.
+  `AIBrainComponent.cpp`): `0` = default state machine only, `1` = LLM decisions are accepted.
+  **Gotchas**: a derived-class parameter must not be named `Blackboard` (C4458, `AAIController` has
+  that member); the `Move To` node's `Acceptable Radius` and the controller's `Arrive Radius` are
+  different judgements; the player pawn itself is a `BP_SteampunkCat`, so a cat inside
+  `ChasingTarget` is normal.
   The speech bubble is a world-space `WidgetComponent` created in `ASteampunkCatNPC`; the widget
   asset is `Content/UI/WBP_BubbleSpeech` and its text block **must be named `SpeechText`**.
   The cat Blueprint actually placed in the level is

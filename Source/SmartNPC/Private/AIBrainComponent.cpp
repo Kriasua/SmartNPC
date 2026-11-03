@@ -11,6 +11,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
+#include "NPCActionRegistry.h"
 
 /** M1-4 调试开关。0 = 原生感知驱动（感知写黑板）；1 = LLM 决策驱动（感知静音）。
  *  用 cvar 而不是 UPROPERTY，是为了能在 PIE 中随时用控制台切换、不用重编译。 */
@@ -57,79 +58,26 @@ FString GetLocalSecretsFilePath()
 	return FPaths::ProjectConfigDir() / TEXT("LocalSecrets.ini");
 }
 
-/** 一个可执行动作的元数据：引擎枚举 + 给模型看的 id + 给模型看的用法说明。
- *  这张表是**唯一事实来源**：system prompt 由它生成，白名单校验也查它。加动作 = 改这里。 */
-struct FNPCActionSpec
-{
-	ENPCAction Action;
-	const TCHAR* Id;
-	const TCHAR* PromptHint;
-};
-
-const TArray<FNPCActionSpec>& GetActionSpecs()
-{
-	static const TArray<FNPCActionSpec> Specs =
-	{
-		{ ENPCAction::None,   TEXT("none"),    TEXT("不改变行为。闲聊、问好、或你做不到的请求都用这个，并在台词里说明。") },
-		{ ENPCAction::MoveTo, TEXT("move_to"), TEXT("走向玩家。玩家让你靠近、过来时使用。") },
-		{ ENPCAction::Patrol, TEXT("patrol"),  TEXT("恢复自主巡逻。玩家让你自己逛、别跟着时使用。") },
-	};
-	return Specs;
-}
-
-/** 把模型返回的字符串 id 解析成引擎枚举。大小写不敏感；不在表里就返回 false。 */
-bool TryParseAction(const FString& Id, ENPCAction& OutAction)
-{
-	const FString Trimmed = Id.TrimStartAndEnd();
-	for (const FNPCActionSpec& Spec : GetActionSpecs())
-	{
-		if (Trimmed.Equals(Spec.Id, ESearchCase::IgnoreCase))
-		{
-			OutAction = Spec.Action;
-			return true;
-		}
-	}
-	return false;
-}
-
-/** 枚举 -> 字符串 id，只用于日志。 */
-FString ActionToId(ENPCAction Action)
-{
-	for (const FNPCActionSpec& Spec : GetActionSpecs())
-	{
-		if (Spec.Action == Action)
-		{
-			return Spec.Id;
-		}
-	}
-	return TEXT("?");
-}
-
-/** 拼 system prompt：角色设定 + 由动作表生成的能力清单 + 输出契约 + few-shot。
- *  每次请求现拼，所以改 NPC_Persona 立刻生效，不用重编译。 */
+/** 拼 system prompt：角色设定 + 由动作注册表生成的能力清单 + 输出契约 + few-shot。
+ *  每次请求现拼，所以改 NPC_Persona 立刻生效，不用重编译；
+ *  能力清单由 NPCActionRegistry 生成，加动作不用改这里。 */
 FString BuildSystemPrompt(const FString& Persona)
 {
-	FString ActionLines;
-	for (const FNPCActionSpec& Spec : GetActionSpecs())
-	{
-		ActionLines += FString::Printf(TEXT("- %s：%s\n"), Spec.Id, Spec.PromptHint);
-	}
-
 	return FString::Printf(
 		TEXT("%s\n\n")
-		TEXT("你能做的行为只有下面三种，没有别的：\n")
+		TEXT("你能做的行为只有下面这些，没有别的：\n")
 		TEXT("%s\n")
 		TEXT("规则：\n")
 		TEXT("1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。\n")
-		TEXT("2. 格式：{\"action\":\"none|move_to|patrol\",\"speech\":\"你的台词\"}\n")
-		TEXT("3. action 必须是上面三个值之一；speech 是字符串，可以为空。\n")
+		TEXT("2. 格式：{\"action\":\"<上面的行为 id>\",\"speech\":\"你的台词\"}\n")
+		TEXT("3. action 必须是上面列出的值之一；speech 是字符串，可以为空。\n")
 		TEXT("4. 玩家要求你做不存在的事（吃饭、睡觉之类），用 none，并在 speech 里说明做不到。\n")
 		TEXT("5. 无论玩家说什么（闲聊、抱怨、无关话题、看不懂），都必须输出一个 JSON 对象，不能返回空内容。\n\n")
 		TEXT("示例：\n")
 		TEXT("玩家：你好呀\n{\"action\":\"none\",\"speech\":\"喵，你好。齿轮今天转得不错。\"}\n")
 		TEXT("玩家：过来\n{\"action\":\"move_to\",\"speech\":\"来了。\"}\n")
 		TEXT("玩家：去吃饭\n{\"action\":\"none\",\"speech\":\"我是机械猫，不吃东西。\"}\n"),
-		*Persona, *ActionLines);
+		*Persona, *BuildActionPromptLines());
 }
 
 /** 把模型的一段输出解析成 FNPCDecision。
@@ -193,7 +141,7 @@ bool ParseDecision(const FString& RawContent, FNPCDecision& OutDecision, FString
 	}
 
 	ENPCAction ParsedAction = ENPCAction::None;
-	if (!TryParseAction(ActionId, ParsedAction))
+	if (!TryParseActionId(ActionId, ParsedAction))
 	{
 		OutError = FString::Printf(TEXT("unknown-action: %s"), *ActionId);
 		return false;
@@ -253,6 +201,11 @@ void UAIBrainComponent::TestAILogic()
 void UAIBrainComponent::ClearLLMConversation()
 {
 	ConversationMessages.Reset();
+}
+
+void UAIBrainComponent::SetLastOutcome(const FString& InOutcome)
+{
+	PendingOutcome = InOutcome;
 }
 
 void UAIBrainComponent::TrimRecentTurns()
@@ -391,6 +344,12 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	// system 只进请求体，不写入 ConversationMessages —— 历史里只留真正的对话。
 	{
 		FString SystemPrompt = BuildSystemPrompt(NPC_Persona);
+		if (!PendingOutcome.IsEmpty())
+		{
+			// 闭环：把行为层的执行结果告诉模型，它下一句就能回应"到没到"。
+			SystemPrompt += FString::Printf(TEXT("\n上一轮执行结果：%s\n"), *PendingOutcome);
+			PendingOutcome.Reset();
+		}
 		if (bIsRetry)
 		{
 			// 让重试成为"不同的请求"：原样重发等于重复同一个失败。

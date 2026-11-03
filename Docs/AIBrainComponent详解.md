@@ -1,5 +1,12 @@
 # AIBrainComponent 逐行说明（面向不熟悉 UE C++ 的读者）
 
+> ⚠️ **本文已落后于源码（2026-11-03）。** 它写于 M1-2 之前，讲解的是"没有 system prompt、没有重试"的版本。
+> 此后组件新增了：system prompt 与 `{action,speech}` 契约、`ParseDecision()` 白名单校验、
+> 失败重试与回退、动作注册表（`NPCActionRegistry`）、`OnNPCDecision` 委托。
+> **行号与部分讲解已对不上，请以源码为准**，背景与取舍见 [项目现状与路线图](项目现状与路线图.md)。
+> 本文仍然准确的部分：HTTP 调用流程、线程边界与 `BroadcastOnGameThread`、密钥三级回退、历史裁剪。
+> 计划在 M2-5（README 重写）时一并重写本文。
+
 本文对应工程中的：
 
 - [Source/SmartNPC/Public/AIBrainComponent.h](../Source/SmartNPC/Public/AIBrainComponent.h)

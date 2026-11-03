@@ -120,6 +120,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
 	void ClearLLMConversation();
 
+	/** 行为层回填的执行结果（"move_to 完成（用时 3.2 秒）"）。
+	 *  会拼进**下一次**请求的 system prompt，让模型知道自己上一句有没有办成；用完即清空。 */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
+	void SetLastOutcome(const FString& InOutcome);
+
 	/** Resolves the key for each request, in order: SMARTNPC_LLM_API_KEY / DEEPSEEK_API_KEY
 	 *  (legacy DASHSCOPE_API_KEY last) environment variable -> gitignored
 	 *  Config/LocalSecrets.ini -> SetLLMAPIKey() override. */
@@ -164,4 +169,7 @@ private:
 	int32 StatOk = 0;
 	int32 StatRetry = 0;
 	int32 StatFail = 0;
+
+	/** 待回填给模型的执行结果，只生效一次。 */
+	FString PendingOutcome;
 };
