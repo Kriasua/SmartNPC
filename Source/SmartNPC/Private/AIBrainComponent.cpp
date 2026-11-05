@@ -13,19 +13,6 @@
 #include "Misc/Paths.h"
 #include "NPCActionRegistry.h"
 
-/** M1-4 调试开关。0 = 原生感知驱动（感知写黑板）；1 = LLM 决策驱动（感知静音）。
- *  用 cvar 而不是 UPROPERTY，是为了能在 PIE 中随时用控制台切换、不用重编译。 */
-static TAutoConsoleVariable<int32> CVarSmartNPCMode(
-	TEXT("SmartNPC.Mode"),
-	0,
-	TEXT("0 = native AI (perception drives the cat)   1 = LLM decisions"),
-	ECVF_Default);
-
-bool IsLLMModeEnabled()
-{
-	return CVarSmartNPCMode.GetValueOnGameThread() != 0;
-}
-
 namespace
 {
 FString NormalizeBaseUrl(const FString& InUrl)
@@ -72,10 +59,13 @@ FString BuildSystemPrompt(const FString& Persona)
 		TEXT("2. 格式：{\"action\":\"<上面的行为 id>\",\"speech\":\"你的台词\"}\n")
 		TEXT("3. action 必须是上面列出的值之一；speech 是字符串，可以为空。\n")
 		TEXT("4. 玩家要求你做不存在的事（吃饭、睡觉之类），用 none，并在 speech 里说明做不到。\n")
-		TEXT("5. 无论玩家说什么（闲聊、抱怨、无关话题、看不懂），都必须输出一个 JSON 对象，不能返回空内容。\n\n")
+		TEXT("5. 无论玩家说什么（闲聊、抱怨、无关话题、看不懂），都必须输出一个 JSON 对象，不能返回空内容。\n")
+		TEXT("6. action 表示进入一个持续的状态，会一直保持到你给出下一个 action；none 表示不改变状态。\n\n")
 		TEXT("示例：\n")
 		TEXT("玩家：你好呀\n{\"action\":\"none\",\"speech\":\"喵，你好。齿轮今天转得不错。\"}\n")
-		TEXT("玩家：过来\n{\"action\":\"move_to\",\"speech\":\"来了。\"}\n")
+		TEXT("玩家：过来\n{\"action\":\"follow\",\"speech\":\"来了。\"}\n")
+		TEXT("玩家：你自己去逛\n{\"action\":\"patrol\",\"speech\":\"好，我去巡厂。\"}\n")
+		TEXT("玩家：打它\n{\"action\":\"combat\",\"speech\":\"看我的！\"}\n")
 		TEXT("玩家：去吃饭\n{\"action\":\"none\",\"speech\":\"我是机械猫，不吃东西。\"}\n"),
 		*Persona, *BuildActionPromptLines());
 }

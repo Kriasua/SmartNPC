@@ -10,10 +10,6 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnLLMChatFinished, bool, bSuccess, FString, Message);
 
-/** M1-4 调试开关：控制台 `SmartNPC.Mode 0|1`（0 = 原生感知驱动，1 = LLM 决策）。
- *  定义在 AIBrainComponent.cpp；感知侧与决策侧都读它，保证同一时刻只有一个写入者。 */
-SMARTNPC_API bool IsLLMModeEnabled();
-
 USTRUCT(BlueprintType)
 struct FLLMChatMessage
 {
@@ -26,13 +22,14 @@ struct FLLMChatMessage
 	FString Content;
 };
 
-/** M1-2: 引擎侧真正能执行的意图。LLM 只能从这三个里选，其它一律按非法输出处理。 */
+/** 行为树顶层的状态。LLM 只负责"进入哪个状态"，具体怎么执行由行为树决定。 */
 UENUM(BlueprintType)
 enum class ENPCAction : uint8
 {
 	None    UMETA(DisplayName = "None"),
-	MoveTo  UMETA(DisplayName = "MoveTo"),
+	Follow  UMETA(DisplayName = "Follow"),
 	Patrol  UMETA(DisplayName = "Patrol"),
+	Combat  UMETA(DisplayName = "Combat"),
 };
 
 /** M1-2: 一次决策的解析结果。M1-4 起随 OnNPCDecision 广播给行为层。 */

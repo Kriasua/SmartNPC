@@ -4,61 +4,50 @@
 #include "SteampuckCatAIController.h"
 #include "BehaviorTree/BlackboardComponent.h"
 
-namespace
-{
-	ASteampuckCatAIController* AsCat(const AAIController& Controller)
-	{
-		return Cast<ASteampuckCatAIController>(&const_cast<AAIController&>(Controller));
-	}
-}
-
 const TArray<FActionRuntime>& GetActionRuntimes()
 {
-	// 加动作：在下面加一行，并在 ASteampuckCatAIController 里实现对应的 Apply/IsComplete。
+	// 加状态：在下面加一行，并在 ASteampuckCatAIController 里实现对应的 Apply。
 	static const TArray<FActionRuntime> Table =
 	{
 		{
 			ENPCAction::None,
 			TEXT("none"),
-			TEXT("不改变行为。闲聊、问好、或你做不到的请求都用这个，并在台词里说明。"),
-			false,
-			[](AAIController& Controller, UBlackboardComponent& Blackboard, const FNPCDecision& Decision)
+			TEXT("不改变当前状态。闲聊、问好、或你做不到的请求都用这个，并在台词里说明。"),
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
-				return Cat ? Cat->ApplyNoneAction(Blackboard, Decision) : false;
-			},
-			[](const AAIController&, const FActiveGoal&)
-			{
-				return true;    // 瞬间完成
+				return Cat ? Cat->ApplyNoneAction(BlackboardComp, Decision) : false;
 			}
 		},
 		{
-			ENPCAction::MoveTo,
-			TEXT("move_to"),
-			TEXT("走向玩家。玩家让你靠近、过来时使用。"),
-			false,
-			[](AAIController& Controller, UBlackboardComponent& Blackboard, const FNPCDecision& Decision)
+			ENPCAction::Follow,
+			TEXT("follow"),
+			TEXT("跟着玩家走。玩家让你靠近、过来、跟着他时使用。"),
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
-				return Cat ? Cat->ApplyMoveToAction(Blackboard, Decision) : false;
-			},
-			[](const AAIController& Controller, const FActiveGoal& Goal)
-			{
-				const ASteampuckCatAIController* Cat = AsCat(Controller);
-				return Cat ? Cat->IsMoveToComplete(Goal) : false;
+				return Cat ? Cat->ApplyFollowAction(BlackboardComp, Decision) : false;
 			}
 		},
 		{
 			ENPCAction::Patrol,
 			TEXT("patrol"),
-			TEXT("恢复自主巡逻。玩家让你自己逛、别跟着时使用。"),
-			true,   // mode：没有终点
-			[](AAIController& Controller, UBlackboardComponent& Blackboard, const FNPCDecision& Decision)
+			TEXT("自己去巡逻。玩家让你自己逛逛、别跟着、原地待着时使用。"),
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
-				return Cat ? Cat->ApplyPatrolAction(Blackboard, Decision) : false;
-			},
-			nullptr
+				return Cat ? Cat->ApplyPatrolAction(BlackboardComp, Decision) : false;
+			}
+		},
+		{
+			ENPCAction::Combat,
+			TEXT("combat"),
+			TEXT("进入战斗状态，攻击目标。玩家让你打、开火、进入战斗时使用。"),
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
+			{
+				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
+				return Cat ? Cat->ApplyCombatAction(BlackboardComp, Decision) : false;
+			}
 		},
 	};
 

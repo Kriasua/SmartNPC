@@ -5,7 +5,6 @@
 #include "CoreMinimal.h"
 #include "AIController.h"
 #include "AIBrainComponent.h"
-#include "NPCActionRegistry.h"
 #include "Perception/AIPerceptionComponent.h"
 #include "Perception/AISenseConfig_Prediction.h"
 #include "Perception/AISenseConfig_Sight.h"
@@ -16,13 +15,11 @@ class UBlackboardComponent;
 /**
  * 友方机械猫的 AI 控制器。
  *
- * 三层结构：
- *   1. 默认状态机   —— 按玩家距离决定"跟随 / 自主巡逻"（含滞回）
- *   2. LLM 意图     —— 覆盖默认状态；有终点的 goal 由条件判定完成，无终点的 mode 持续生效
- *   3. 感知         —— 只写事实（IsPlayerInSight / LastKnownLocation），不写行为状态
- *
- * 切换与仲裁：`SmartNPC.Mode 0|1` 决定是否接受 LLM 决策。同一时刻只有一个写入者，
- * 所以两套逻辑不会互相覆盖。
+ * 职责划分（刻意保持简单）：
+ *   - LLM 只负责**切换行为树顶层的 NPCBehaviour 状态**：patrol / follow / combat。
+ *   - 行为树负责"怎么执行"：追谁、开几枪、走哪条巡逻路线。
+ *   - 感知只写事实（IsPlayerInSight / LastKnownLocation），不写行为状态。
+ *   - 初始状态为 Patrol；没有任何"距离自动切换"的逻辑——所有状态变化都来自 LLM。
  */
 UCLASS()
 class SMARTNPC_API ASteampuckCatAIController : public AAIController
@@ -36,12 +33,12 @@ public:
 	virtual void OnUnPossess() override;
 	virtual void Tick(float DeltaSeconds) override;
 
-	// ---- 供动作注册表（NPCActionRegistry）调用的执行与判定 ----
+	// ---- 供动作注册表（NPCActionRegistry）调用的状态切换 ----
 	// 参数名刻意避开 "Blackboard"：AAIController 有同名成员，局部同名会触发 C4458（警告即错误）。
 	bool ApplyNoneAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
-	bool ApplyMoveToAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
+	bool ApplyFollowAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
 	bool ApplyPatrolAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
-	bool IsMoveToComplete(const FActiveGoal& Goal) const;
+	bool ApplyCombatAction(UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision);
 
 protected:
 	virtual void BeginPlay() override;
@@ -58,24 +55,6 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category = "AI|Perception")
 	UAISenseConfig_Prediction* PredictionConfig;
 
-	// ---- 行为参数（蓝图可调，不用改代码） ----
-
-	/** 目标动作的到达半径：走进这个距离就算 move_to 完成。 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
-	float ArriveRadius = 250.f;
-
-	/** 玩家进入这个距离 -> 开始跟随（默认状态机）。 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
-	float FollowEnterRadius = 600.f;
-
-	/** 玩家离开这个距离 -> 停止跟随。与 Enter 拉开距离形成滞回，避免抖动。 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "10"))
-	float FollowExitRadius = 900.f;
-
-	/** 兜底：goal 超过这个时间仍未完成就放弃（异常路径，不是"意图有效期"）。 */
-	UPROPERTY(EditDefaultsOnly, Category = "AI|Behaviour", meta = (ClampMin = "1"))
-	float WatchdogSeconds = 60.f;
-
 	UFUNCTION()
 	void onTargetPerceptionUpdated(AActor* UpdatedActor, FAIStimulus Stimulus);
 
@@ -87,26 +66,13 @@ protected:
 	static bool ResolveBehaviourValue(UBlackboardComponent* BlackboardComp, const TCHAR* ValueName, uint8& OutValue);
 
 private:
-	/** 当前谁在驾驶：无（默认状态机）/ 目标 / 模式。 */
-	enum class EHold : uint8
-	{
-		None,
-		Goal,
-		Mode,
-	};
-
-	void UpdateDefaultState();
-	void FinishGoal(const TCHAR* Reason);
-	void ResetBlackboardToNative();
+	/** 把 NPCBehaviour 写成指定名字对应的枚举值。 */
+	bool WriteBehaviour(UBlackboardComponent& BlackboardComp, const TCHAR* ValueName);
 
 	APawn* GetPlayerPawn() const;
-	float DistanceToPlayer() const;
 
 	TWeakObjectPtr<UAIBrainComponent> Brain;
 
-	EHold Hold = EHold::None;
-	FActiveGoal ActiveGoal;
-
-	/** 上一次看到的模式值，用于检测切换。 */
-	bool bLastLLMMode = false;
+	/** 初始状态（Patrol）只在黑板创建之后写一次。 */
+	bool bInitialStateApplied = false;
 };

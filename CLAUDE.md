@@ -74,24 +74,27 @@ commit. `git add` is only part of an already-approved commit.
   never behaviour state; the misspelled name is the real class name), `SteampunkCatNPC.*` (pawn,
   patrol points, `FireLaser()`, speech bubble), `FindSearchPoint` / `BTTask_SetPatrolLocation` /
   `BTTask_SetStillPatrolPointLoc` / `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage
-  notify → `FireLaser()`). Blackboard keys: `IsPlayerInSight`, `bShouldFollow` (the behaviour tree's
-  top-level gate), `ChasingTarget`, `LastKnownLocation`, `NPCBehaviour`, `TargetLocation`,
-  `SearchPoint`. Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}` (spelling as-is).
-  **Who drives what:** a default state machine decides follow (player within 600) vs patrol (beyond
-  900, hysteresis), and an accepted LLM intent overrides it. Intents come in two kinds — **goal**
-  (`move_to`: completed by a predicate, e.g. within `ArriveRadius`) and **mode** (`patrol`: no end,
-  persists until replaced). A 60 s watchdog only guards against getting stuck. The finished goal's
-  outcome is fed back into the next request's system prompt, so the model knows whether its last
-  command worked.
+  notify → `FireLaser()`). Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`,
+  `NPCBehaviour` (the behaviour tree's only top-level gate), `TargetLocation`, `SearchPoint`.
+  Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}` (spelling as-is).
+  **Who drives what:** the LLM only switches the top-level **`NPCBehaviour` enum**
+  (`Follow` / `Patrol` / `Combat`; `none` = leave it alone). Initial state is `Patrol`; there is no
+  distance-based auto-switching and no mode switch — every state change comes from a decision. The
+  behaviour tree owns execution: movement, firing, the 2 s cooldown. Perception writes facts only.
+  `none` deliberately does **not** stop a running state; the player has to say "去巡逻" to leave combat.
   **Action registry**: `Source/SmartNPC/{Public,Private}/NPCActionRegistry.*` is the single source of
-  truth for prompt lines, the whitelist, execution and completion checks — adding an action = one row
-  plus one handler on the controller.
-  **Two drive modes**, switched at runtime with the `SmartNPC.Mode` cvar (defined in
-  `AIBrainComponent.cpp`): `0` = default state machine only, `1` = LLM decisions are accepted.
+  truth for prompt lines, the whitelist and execution — adding a state = one row plus one `Apply*`
+  function on the controller.
+  **Health**: `UHealthComponent` (data + `OnHealthChanged` broadcast only) on the player pawn;
+  `UHealthWidgetBase` (a `UUserWidget` that subscribes itself in `NativeConstruct`) drives
+  `WBP_HealthBar`, which sits inside `WBP_HUD`. Damage flows
+  `FireLaser → ApplyPointDamage → Event AnyDamage → ApplyDamage`; the console command `AIFire` fires
+  once at the player for testing.
   **Gotchas**: a derived-class parameter must not be named `Blackboard` (C4458, `AAIController` has
-  that member); the `Move To` node's `Acceptable Radius` and the controller's `Arrive Radius` are
-  different judgements; the player pawn itself is a `BP_SteampunkCat`, so a cat inside
-  `ChasingTarget` is normal.
+  that member); only the `Move To` node's `Acceptable Radius` exists now (the controller's old
+  `ArriveRadius` was removed); the player pawn itself is a `BP_SteampunkCat`, so a cat inside
+  `ChasingTarget` is normal; `AActor::TakeDamage` does **not** reduce health by itself; the `Search`
+  branch is currently unreachable (no action maps to it).
   The speech bubble is a world-space `WidgetComponent` created in `ASteampunkCatNPC`; the widget
   asset is `Content/UI/WBP_BubbleSpeech` and its text block **must be named `SpeechText`**.
   The cat Blueprint actually placed in the level is

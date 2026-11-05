@@ -8,38 +8,27 @@
 class AAIController;
 class UBlackboardComponent;
 
-/** 一个"有终点"的活跃目标。mode 类型的动作（如 patrol）不会产生它。 */
-struct FActiveGoal
-{
-	ENPCAction Action = ENPCAction::None;
-	TWeakObjectPtr<AActor> Target;
-	double StartedAt = 0.0;
-};
-
 /**
  * 动作的运行期定义。
  *
- * 提示词、白名单校验、执行、完成判定**共用这一张表** —— 加一个动作 = 在这里加一行
- * （再在控制器里实现它的 Apply / IsComplete）。这样可以避免"模型会说、引擎不认"的漂移。
+ * 这里的"动作"其实是**状态切换**：follow / patrol / combat 都是行为树顶层的
+ * NPCBehaviour 枚举值，LLM 只决定"进入哪个状态"，具体怎么执行由行为树负责。
+ *
+ * 提示词、白名单校验、执行共用这一张表 —— 加一个状态 = 在这里加一行
+ * （再在控制器里实现它的 Apply）。这样可以避免"模型会说、引擎不认"的漂移。
  */
 struct FActionRuntime
 {
 	ENPCAction Action = ENPCAction::None;
 
-	/** 给模型看的 id，例如 "move_to"。 */
+	/** 给模型看的 id，例如 "follow"。 */
 	const TCHAR* Id = TEXT("");
 
 	/** 写进 system prompt 的用法说明。 */
 	const TCHAR* PromptHint = TEXT("");
 
-	/** true = 无终点的状态（patrol，只能被新意图覆盖）；false = 有终点的目标（move_to）。 */
-	bool bIsMode = false;
-
 	/** 执行：写黑板。返回 false 表示这次执行失败（例如找不到玩家）。 */
 	TFunction<bool(AAIController&, UBlackboardComponent&, const FNPCDecision&)> Apply;
-
-	/** 完成判定；mode 类型留空。 */
-	TFunction<bool(const AAIController&, const FActiveGoal&)> IsComplete;
 };
 
 /** 唯一的动作注册表。函数内静态，避免跨编译单元的初始化顺序问题。 */

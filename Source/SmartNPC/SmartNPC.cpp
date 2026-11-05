@@ -141,6 +141,72 @@ static void SmartNPCAIChatCommand(const TArray<FString>& Args)
 	BestBrain->SendRequestToLLM(Text);
 }
 
+/**
+ * M2 之前的调试命令：让"离玩家最近的那只猫"转身朝玩家开一枪。
+ *
+ * 用途：猫的攻击蒙太奇已经从行为树里摘掉（友方化之后不再自动攻击），
+ * 但伤害链路（射线 → ApplyPointDamage → Event AnyDamage → HealthComponent → 血条）
+ * 仍然需要一条触发路径来验证。
+ */
+static void SmartNPCAIFireCommand(const TArray<FString>& Args)
+{
+	using namespace SmartNPCChatCommand;
+
+	UWorld* World = FindGameWorld();
+	if (!World)
+	{
+		PrintToScreen(TEXT("no game world — start PIE first"), FColor::Yellow);
+		return;
+	}
+
+	APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(World, 0);
+
+	ASteampunkCatNPC* BestCat = nullptr;
+	float BestDistSq = TNumericLimits<float>::Max();
+
+	for (TActorIterator<ASteampunkCatNPC> It(World); It; ++It)
+	{
+		ASteampunkCatNPC* Cat = *It;
+		if (!Cat)
+		{
+			continue;
+		}
+
+		const float DistSq = PlayerPawn
+			? FVector::DistSquared(PlayerPawn->GetActorLocation(), Cat->GetActorLocation())
+			: 0.f;
+
+		if (!BestCat || DistSq < BestDistSq)
+		{
+			BestCat = Cat;
+			BestDistSq = DistSq;
+		}
+	}
+
+	if (!BestCat)
+	{
+		PrintToScreen(TEXT("no ASteampunkCatNPC in this world"), FColor::Yellow);
+		return;
+	}
+
+	// FireLaser() 沿 Actor 前向发射，所以先让猫面向玩家，否则大概率打不中。
+	if (PlayerPawn)
+	{
+		const FVector ToPlayer = PlayerPawn->GetActorLocation() - BestCat->GetActorLocation();
+		BestCat->SetActorRotation(FRotator(0.f, ToPlayer.Rotation().Yaw, 0.f));
+	}
+
+	PrintToScreen(FString::Printf(TEXT("%s fires at %s"),
+		*BestCat->GetName(), PlayerPawn ? *PlayerPawn->GetName() : TEXT("<no player>")), FColor::Orange);
+
+	BestCat->FireLaser();
+}
+
+static FAutoConsoleCommand GSmartNPCAIFireCommand(
+	TEXT("AIFire"),
+	TEXT("Debug: the nearest cat turns to the player and fires its laser once."),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&SmartNPCAIFireCommand));
+
 static FAutoConsoleCommand GSmartNPCAIChatCommand(
 	TEXT("AIChat"),
 	TEXT("Send one line of text to the nearest cat NPC's LLM brain. "
