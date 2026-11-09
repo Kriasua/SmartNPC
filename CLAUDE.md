@@ -59,12 +59,24 @@ commit. `git add` is only part of an already-approved commit.
 
 - **LLM brain** `Source/SmartNPC/{Public,Private}/AIBrainComponent.*`: appends the user turn, POSTs
   chat/completions with a **system prompt**, pops that turn again on *any* failure, trims to
-  `MaxTurns*2`, and always replies through `BroadcastOnGameThread` → `OnLLMChatFinished`. The reply
-  is a strict JSON decision (`{action,speech}`, action ∈ `none|move_to|patrol`), parsed and
-  whitelisted by `ParseDecision()`; failures retry once with a nudge, then fall back to a visible
-  error. No streaming. Valid decisions leave through `OnNPCDecision` (structured) and
-  `OnLLMChatFinished` (speech text). The key is resolved per request by `GetLLMAPIKey()` (env var →
-  gitignored ini → `SetLLMAPIKey()`), never from a serialized property.
+  `MaxTurns*2`, and always replies through `BroadcastOnGameThread` → `OnLLMChatFinished`.
+  **Protocol (ReAct tool loop):** every reply is one JSON object — either
+  `{"type":"final_answer","text":"..."}` or `{"type":"tool_call","tool":"<id>","args":{...}}`.
+  `ParseDecision()` validates shape only; the tool set lives in `NPCActionRegistry`
+  (`query_world`, `move_to`, `idle`, `follow`, `patrol`, `combat`).
+  A turn may run up to `MaxToolSteps` (default 3) tool calls: each result is reported back by the
+  controller as `FToolResult`, wrapped into a **`[观察] {...}`** user message, and the loop asks the
+  model again (deferred one tick via `AsyncTask` to avoid re-entrancy). Those `[观察]` messages live
+  in `LoopObservations` and are **never** written to `ConversationMessages`; only the final
+  `final_answer` JSON is persisted, so history stays one-command-one-reply.
+  Guards: `bToolLoopActive` / `bAwaitingToolResult` make stray reports free (no API call);
+  identical consecutive `tool|args` aborts the loop; exceeding the step budget aborts it too.
+  The system prompt also carries **`当前状态：<state>`** (pushed by the controller through
+  `SetCurrentStateHint()`), because without it the model happily claims "I stopped" while patrolling.
+  Failures retry once with a nudge, then fall back to a visible error. No streaming. Valid decisions
+  leave through `OnNPCDecision` (structured) and `OnLLMChatFinished` (speech text). The key is
+  resolved per request by `GetLLMAPIKey()` (env var → gitignored ini → `SetLLMAPIKey()`), never from a
+  serialized property.
   **Invariant learned the hard way:** assistant turns in `ConversationMessages` must store the
   **raw JSON**, never the spoken line — a plain-text assistant turn combined with
   `response_format=json_object` makes the model return whitespace only (17/20 requests). Reproduce
@@ -74,14 +86,20 @@ commit. `git add` is only part of an already-approved commit.
   never behaviour state; the misspelled name is the real class name), `SteampunkCatNPC.*` (pawn,
   patrol points, `FireLaser()`, speech bubble), `FindSearchPoint` / `BTTask_SetPatrolLocation` /
   `BTTask_SetStillPatrolPointLoc` / `NPCPlayAttackMontage` (BTTasks), `AttackLaserNotify` (montage
-  notify → `FireLaser()`). Blackboard keys: `IsPlayerInSight`, `ChasingTarget`, `LastKnownLocation`,
-  `NPCBehaviour` (the behaviour tree's only top-level gate), `TargetLocation`, `SearchPoint`.
+  notify → `FireLaser()`). Blackboard keys (actual, in `BB_Chase`): `Target` (Vector), `SelfActor`
+  (Object), `IsPlayerInSight` (Bool), `ChasingTarget` (Object), `NPCBehaviour` (Enum),
+  `LastKnownLocation` (Vector), `SearchPoint` (Vector), `bShouldFollow` (Bool, **legacy — unused since
+  the LLM-driven state model**), `TargetLocation` (Vector, used by `move_to`).
   Assets: `Content/NPC/LittleCat/{BehavierTree,BlackBoard,Enum}` (spelling as-is).
-  **Who drives what:** the LLM only switches the top-level **`NPCBehaviour` enum**
-  (`Follow` / `Patrol` / `Combat`; `none` = leave it alone). Initial state is `Patrol`; there is no
-  distance-based auto-switching and no mode switch — every state change comes from a decision. The
-  behaviour tree owns execution: movement, firing, the 2 s cooldown. Perception writes facts only.
-  `none` deliberately does **not** stop a running state; the player has to say "去巡逻" to leave combat.
+  **Who drives what:** the LLM switches the top-level **`NPCBehaviour` enum** through tools
+  (`idle` → the enum value displayed as `Default`, `follow`, `patrol`, `combat`, `move_to` → `GoTo`).
+  Initial state is `Patrol`. The behaviour tree owns execution: movement, firing, the 2 s cooldown.
+  Perception writes facts only. `final_answer` never changes state — a "stop" only works if the model
+  emits `idle`, which is why the prompt carries the current state.
+  **`move_to` is location-based on purpose:** `MoveToActor` targets the actor *origin*, which sits
+  inside a static mesh's collision (the navmesh is carved there) and is rejected instantly; the
+  controller projects and pushes the goal point out by `GoalOffsetCm` and the BT moves to
+  `TargetLocation` instead.
   **Action registry**: `Source/SmartNPC/{Public,Private}/NPCActionRegistry.*` is the single source of
   truth for prompt lines, the whitelist and execution — adding a state = one row plus one `Apply*`
   function on the controller.
@@ -94,7 +112,10 @@ commit. `git add` is only part of an already-approved commit.
   that member); only the `Move To` node's `Acceptable Radius` exists now (the controller's old
   `ArriveRadius` was removed); the player pawn itself is a `BP_SteampunkCat`, so a cat inside
   `ChasingTarget` is normal; `AActor::TakeDamage` does **not** reduce health by itself; the `Search`
-  branch is currently unreachable (no action maps to it).
+  branch is currently unreachable; `UE_LOG`'s verbosity argument must be a compile-time literal
+  (passing a runtime `ELogVerbosity::Type` does not compile); a Blueprint BT task's `Succeeded` pin
+  must be driven by an **Instance Editable** variable, not a constant checkbox — otherwise the
+  success branch reports `false` while the engine says `code=Success`.
   The speech bubble is a world-space `WidgetComponent` created in `ASteampunkCatNPC`; the widget
   asset is `Content/UI/WBP_BubbleSpeech` and its text block **must be named `SpeechText`**.
   The cat Blueprint actually placed in the level is

@@ -6,23 +6,47 @@
 
 const TArray<FActionRuntime>& GetActionRuntimes()
 {
-	// 加状态：在下面加一行，并在 ASteampuckCatAIController 里实现对应的 Apply。
+	// 加工具：在下面加一行，并在 ASteampuckCatAIController 里实现对应的 Apply。
 	static const TArray<FActionRuntime> Table =
 	{
 		{
-			ENPCAction::None,
-			TEXT("none"),
-			TEXT("不改变当前状态。闲聊、问好、或你做不到的请求都用这个，并在台词里说明。"),
+			TEXT("query_world"),
+			TEXT("查看整个地图：所有可交互物、玩家位置、自己状态。需要知道环境时先调它。"),
+			TEXT("无参数"),
+			EToolKind::Query,
 			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
-				return Cat ? Cat->ApplyNoneAction(BlackboardComp, Decision) : false;
+				return Cat ? Cat->ApplyQueryWorldAction(BlackboardComp, Decision) : false;
 			}
 		},
 		{
-			ENPCAction::Follow,
+			TEXT("move_to"),
+			TEXT("走向一个目标，走路期间会阻塞，到达或失败后返回结果。target 只能用 query_world 返回的 id。"),
+			TEXT("{\"target\": \"目标 id，例如 player:0 或 actor:3\"}"),
+			EToolKind::BlockingBT,
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
+			{
+				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
+				return Cat ? Cat->ApplyMoveToAction(BlackboardComp, Decision) : false;
+			}
+		},
+		{
+			TEXT("idle"),
+			TEXT("停下、原地站住，什么都不做。玩家让你停手、别打了、等着时用它。"),
+			TEXT("无参数"),
+			EToolKind::InstantState,
+			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
+			{
+				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
+				return Cat ? Cat->ApplyIdleAction(BlackboardComp, Decision) : false;
+			}
+		},
+		{
 			TEXT("follow"),
-			TEXT("跟着玩家走。玩家让你靠近、过来、跟着他时使用。"),
+			TEXT("进入跟随状态：一直跟着玩家，不需要目标参数。"),
+			TEXT("无参数"),
+			EToolKind::InstantState,
 			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
@@ -30,9 +54,10 @@ const TArray<FActionRuntime>& GetActionRuntimes()
 			}
 		},
 		{
-			ENPCAction::Patrol,
 			TEXT("patrol"),
-			TEXT("自己去巡逻。玩家让你自己逛逛、别跟着、原地待着时使用。"),
+			TEXT("进入巡逻状态：自己在巡逻点之间走动，不需要目标参数。"),
+			TEXT("无参数"),
+			EToolKind::InstantState,
 			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
@@ -40,9 +65,10 @@ const TArray<FActionRuntime>& GetActionRuntimes()
 			}
 		},
 		{
-			ENPCAction::Combat,
 			TEXT("combat"),
-			TEXT("进入战斗状态，攻击目标。玩家让你打、开火、进入战斗时使用。"),
+			TEXT("进入战斗状态：追击并开火，不需要目标参数。"),
+			TEXT("无参数"),
+			EToolKind::InstantState,
 			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)
 			{
 				ASteampuckCatAIController* Cat = Cast<ASteampuckCatAIController>(&Controller);
@@ -54,11 +80,12 @@ const TArray<FActionRuntime>& GetActionRuntimes()
 	return Table;
 }
 
-const FActionRuntime* FindActionRuntime(ENPCAction Action)
+const FActionRuntime* FindActionRuntimeById(const FString& Id)
 {
+	const FString Wanted = Id.TrimStartAndEnd();
 	for (const FActionRuntime& Spec : GetActionRuntimes())
 	{
-		if (Spec.Action == Action)
+		if (Wanted.Equals(Spec.Id, ESearchCase::IgnoreCase))
 		{
 			return &Spec;
 		}
@@ -66,38 +93,22 @@ const FActionRuntime* FindActionRuntime(ENPCAction Action)
 	return nullptr;
 }
 
-bool TryParseActionId(const FString& Id, ENPCAction& OutAction)
-{
-	const FString Trimmed = Id.TrimStartAndEnd();
-	for (const FActionRuntime& Spec : GetActionRuntimes())
-	{
-		if (Trimmed.Equals(Spec.Id, ESearchCase::IgnoreCase))
-		{
-			OutAction = Spec.Action;
-			return true;
-		}
-	}
-	return false;
-}
-
-FString ActionToId(ENPCAction Action)
-{
-	for (const FActionRuntime& Spec : GetActionRuntimes())
-	{
-		if (Spec.Action == Action)
-		{
-			return Spec.Id;
-		}
-	}
-	return TEXT("?");
-}
-
 FString BuildActionPromptLines()
 {
 	FString Lines;
 	for (const FActionRuntime& Spec : GetActionRuntimes())
 	{
-		Lines += FString::Printf(TEXT("- %s：%s\n"), Spec.Id, Spec.PromptHint);
+		Lines += FString::Printf(TEXT("- %s：%s  args：%s\n"), *Spec.Id, *Spec.PromptHint, *Spec.ArgsHint);
 	}
 	return Lines;
+}
+
+FString BuildAvailableToolsHint()
+{
+	TArray<FString> Ids;
+	for (const FActionRuntime& Spec : GetActionRuntimes())
+	{
+		Ids.Add(Spec.Id);
+	}
+	return FString::Printf(TEXT("可用工具：%s，也可以直接用 final_answer"), *FString::Join(Ids, TEXT(", ")));
 }

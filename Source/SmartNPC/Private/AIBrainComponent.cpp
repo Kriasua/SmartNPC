@@ -45,33 +45,45 @@ FString GetLocalSecretsFilePath()
 	return FPaths::ProjectConfigDir() / TEXT("LocalSecrets.ini");
 }
 
-/** 拼 system prompt：角色设定 + 由动作注册表生成的能力清单 + 输出契约 + few-shot。
- *  每次请求现拼，所以改 NPC_Persona 立刻生效，不用重编译；
- *  能力清单由 NPCActionRegistry 生成，加动作不用改这里。 */
+/** 拼 system prompt：角色设定 + 由工具注册表生成的能力清单 + 输出协议 + few-shot。
+ *  每次请求现拼，所以改 NPC_Persona 立刻生效；工具清单由 NPCActionRegistry 生成。 */
 FString BuildSystemPrompt(const FString& Persona)
 {
 	return FString::Printf(
 		TEXT("%s\n\n")
-		TEXT("你能做的行为只有下面这些，没有别的：\n")
+		TEXT("你可以通过工具行动。每轮只输出一个 JSON 对象，二选一：\n")
+		TEXT("1) {\"type\":\"tool_call\",\"tool\":\"<工具 id>\",\"args\":{...}}\n")
+		TEXT("2) {\"type\":\"final_answer\",\"text\":\"你的台词\"}\n\n")
+		TEXT("可用工具：\n")
 		TEXT("%s\n")
 		TEXT("规则：\n")
 		TEXT("1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要任何解释文字。\n")
-		TEXT("2. 格式：{\"action\":\"<上面的行为 id>\",\"speech\":\"你的台词\"}\n")
-		TEXT("3. action 必须是上面列出的值之一；speech 是字符串，可以为空。\n")
-		TEXT("4. 玩家要求你做不存在的事（吃饭、睡觉之类），用 none，并在 speech 里说明做不到。\n")
-		TEXT("5. 无论玩家说什么（闲聊、抱怨、无关话题、看不懂），都必须输出一个 JSON 对象，不能返回空内容。\n")
-		TEXT("6. action 表示进入一个持续的状态，会一直保持到你给出下一个 action；none 表示不改变状态。\n\n")
-		TEXT("示例：\n")
-		TEXT("玩家：你好呀\n{\"action\":\"none\",\"speech\":\"喵，你好。齿轮今天转得不错。\"}\n")
-		TEXT("玩家：过来\n{\"action\":\"follow\",\"speech\":\"来了。\"}\n")
-		TEXT("玩家：你自己去逛\n{\"action\":\"patrol\",\"speech\":\"好，我去巡厂。\"}\n")
-		TEXT("玩家：打它\n{\"action\":\"combat\",\"speech\":\"看我的！\"}\n")
-		TEXT("玩家：去吃饭\n{\"action\":\"none\",\"speech\":\"我是机械猫，不吃东西。\"}\n"),
+		TEXT("2. 只能用上面列出的工具 id；args 的字段见工具说明。\n")
+		TEXT("3. 以 [观察] 开头的消息是引擎返回的工具结果，不是玩家说的话。收到后必须继续输出一个 JSON。\n")
+		TEXT("4. 需要知道周围有什么时先调用 query_world，再从返回的 nearby 里挑目标 —— 只能使用出现过的 id。\n")
+		TEXT("5. 工具失败时看 error.hint 调整，不要重复完全相同的调用。\n")
+		TEXT("6. 想说话或结束时用 final_answer；它表示本轮结束。\n")
+		TEXT("7. 玩家要求你做不到的事（吃饭、睡觉之类），直接用 final_answer 说明做不到，不要调用工具。\n")
+		TEXT("8. 即使看不懂玩家的话，也必须输出一个 JSON 对象，不能返回空内容。\n")
+		TEXT("9. 玩家让你停下、别打了、住手、等着时，用 idle 工具原地停住。"
+			"只有当\"当前状态\"已经是 idle 时，才可以直接用 final_answer 回应；否则必须调工具。\n\n")
+		TEXT("示例一（直接回答）：\n")
+		TEXT("玩家：你好呀\n")
+		TEXT("{\"type\":\"final_answer\",\"text\":\"喵，你好。齿轮今天转得不错。\"}\n\n")
+		TEXT("示例二（先观察、再行动、再回答）：\n")
+		TEXT("玩家：去那个球那边\n")
+		TEXT("{\"type\":\"tool_call\",\"tool\":\"query_world\"}\n")
+		TEXT("[观察] {\"tool\":\"query_world\",\"ok\":true,\"status\":\"Succeeded\",\"step\":1,\"elapsed_ms\":9,"
+			"\"result\":{\"nearby\":[{\"id\":\"actor:3\",\"name\":\"红球\",\"distance_m\":8.0,\"direction\":\"front\"}]}}\n")
+		TEXT("{\"type\":\"tool_call\",\"tool\":\"move_to\",\"args\":{\"target\":\"actor:3\"}}\n")
+		TEXT("[观察] {\"tool\":\"move_to\",\"ok\":true,\"status\":\"Succeeded\",\"step\":2,\"elapsed_ms\":4200,"
+			"\"result\":{\"target\":\"actor:3\",\"final_distance_m\":1.2}}\n")
+		TEXT("{\"type\":\"final_answer\",\"text\":\"喵，到球边上了。\"}\n"),
 		*Persona, *BuildActionPromptLines());
 }
 
-/** 把模型的一段输出解析成 FNPCDecision。
- *  只做"结构 + 白名单"，不做行为映射（那是 M1-4）；失败时 OutError 给出可读原因。 */
+/** 把模型的一段输出解析成 FNPCDecision（final_answer 或 tool_call）。
+ *  只做"结构 + 必填字段"，工具是否存在由行为层校验；失败时 OutError 给出可读原因。 */
 bool ParseDecision(const FString& RawContent, FNPCDecision& OutDecision, FString& OutError)
 {
 	FString Json = RawContent.TrimStartAndEnd();
@@ -123,27 +135,82 @@ bool ParseDecision(const FString& RawContent, FNPCDecision& OutDecision, FString
 		}
 	}
 
-	FString ActionId;
-	if (!Root->TryGetStringField(TEXT("action"), ActionId))
+	FString Type;
+	Root->TryGetStringField(TEXT("type"), Type);
+	Type.TrimStartAndEndInline();
+
+	// ---- final_answer ----
+	if (Type.Equals(TEXT("final_answer"), ESearchCase::IgnoreCase))
 	{
-		OutError = TEXT("missing-action");
-		return false;
+		FString Text;
+		if (!Root->TryGetStringField(TEXT("text"), Text))
+		{
+			OutError = TEXT("final_answer-missing-text");
+			return false;
+		}
+
+		OutDecision = FNPCDecision();
+		OutDecision.bFinalAnswer = true;
+		OutDecision.Speech = Text.TrimStartAndEnd();
+		OutError.Reset();
+		return true;
 	}
 
-	ENPCAction ParsedAction = ENPCAction::None;
-	if (!TryParseActionId(ActionId, ParsedAction))
+	// ---- tool_call ----
+	if (Type.Equals(TEXT("tool_call"), ESearchCase::IgnoreCase))
 	{
-		OutError = FString::Printf(TEXT("unknown-action: %s"), *ActionId);
-		return false;
+		FString ToolId;
+		if (!Root->TryGetStringField(TEXT("tool"), ToolId) || ToolId.TrimStartAndEnd().IsEmpty())
+		{
+			OutError = TEXT("tool_call-missing-tool");
+			return false;
+		}
+
+		OutDecision = FNPCDecision();
+		OutDecision.bFinalAnswer = false;
+		OutDecision.ToolId = ToolId.TrimStartAndEnd();
+
+		const TSharedPtr<FJsonObject>* ArgsPtr = nullptr;
+		if (Root->TryGetObjectField(TEXT("args"), ArgsPtr) && ArgsPtr && (*ArgsPtr).IsValid())
+		{
+			const TSharedPtr<FJsonObject>& Args = *ArgsPtr;
+
+			FString Target;
+			if (Args->TryGetStringField(TEXT("target"), Target))
+			{
+				OutDecision.Target = Target.TrimStartAndEnd();
+			}
+		}
+
+		OutError.Reset();
+		return true;
 	}
 
-	FString Speech;
-	Root->TryGetStringField(TEXT("speech"), Speech);
+	// ---- 兼容旧协议：{"action":"follow","speech":"..."} ----
+	FString LegacyAction;
+	if (Root->TryGetStringField(TEXT("action"), LegacyAction))
+	{
+		OutDecision = FNPCDecision();
 
-	OutDecision.Action = ParsedAction;
-	OutDecision.Speech = Speech.TrimStartAndEnd();
-	OutError.Reset();
-	return true;
+		if (LegacyAction.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+		{
+			FString Speech;
+			Root->TryGetStringField(TEXT("speech"), Speech);
+			OutDecision.bFinalAnswer = true;
+			OutDecision.Speech = Speech.TrimStartAndEnd();
+		}
+		else
+		{
+			OutDecision.bFinalAnswer = false;
+			OutDecision.ToolId = LegacyAction.TrimStartAndEnd();
+		}
+
+		OutError.Reset();
+		return true;
+	}
+
+	OutError = TEXT("missing-type");
+	return false;
 }
 }
 
@@ -193,9 +260,121 @@ void UAIBrainComponent::ClearLLMConversation()
 	ConversationMessages.Reset();
 }
 
-void UAIBrainComponent::SetLastOutcome(const FString& InOutcome)
+void UAIBrainComponent::ResetToolLoop()
 {
-	PendingOutcome = InOutcome;
+	LoopObservations.Reset();
+	ToolStepCount = 0;
+	bToolLoopActive = false;
+	bAwaitingToolResult = false;
+	LastToolSignature.Reset();
+	ToolStartedAt = 0.0;
+}
+
+void UAIBrainComponent::AbortToolLoop(const TCHAR* Reason)
+{
+	UE_LOG(LogTemp, Warning, TEXT("[LLM] loop aborted: %s (steps=%d)"), Reason, ToolStepCount);
+
+	// 保持历史自洽：本轮没有产生 assistant 轮，就把这次玩家指令弹回。
+	if (ConversationMessages.Num() > 0 && ConversationMessages.Last().Role == TEXT("user"))
+	{
+		ConversationMessages.Pop(EAllowShrinking::No);
+	}
+
+	ResetToolLoop();
+	BroadcastOnGameThread(false, TEXT("（喵……想太久，先这样吧）"));
+}
+
+bool UAIBrainComponent::IsToolLoopActive() const
+{
+	return bToolLoopActive;
+}
+
+void UAIBrainComponent::SetCurrentStateHint(const FString& InState)
+{
+	CurrentStateHint = InState;
+}
+
+void UAIBrainComponent::ReportToolResult(const FToolResult& Result)
+{
+	if (!bToolLoopActive || !bAwaitingToolResult)
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("[LLM] tool result ignored (no pending tool)"));
+		return;
+	}
+
+	bAwaitingToolResult = false;
+	PushObservationAndContinue(Result);
+}
+
+void UAIBrainComponent::PushObservationAndContinue(const FToolResult& Result)
+{
+	const double ElapsedMs = (ToolStartedAt > 0.0)
+		? (FPlatformTime::Seconds() - ToolStartedAt) * 1000.0
+		: 0.0;
+
+	TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+	Envelope->SetStringField(TEXT("tool"), Result.ToolId);
+	Envelope->SetBoolField(TEXT("ok"), Result.bOk);
+	Envelope->SetStringField(TEXT("status"), Result.Status);
+	Envelope->SetNumberField(TEXT("step"), ToolStepCount);
+	Envelope->SetNumberField(TEXT("elapsed_ms"), FMath::RoundToInt(ElapsedMs));
+
+	if (!Result.bOk)
+	{
+		TSharedPtr<FJsonObject> Error = MakeShared<FJsonObject>();
+		Error->SetStringField(TEXT("code"),
+			Result.ErrorCode.IsEmpty() ? TEXT("failed") : Result.ErrorCode);
+		if (!Result.ErrorHint.IsEmpty())
+		{
+			Error->SetStringField(TEXT("hint"), Result.ErrorHint);
+		}
+		Envelope->SetObjectField(TEXT("error"), Error);
+	}
+
+	if (!Result.ResultJson.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> ParsedResult;
+		const TSharedRef<TJsonReader<>> ResultReader = TJsonReaderFactory<>::Create(Result.ResultJson);
+		if (FJsonSerializer::Deserialize(ResultReader, ParsedResult) && ParsedResult.IsValid())
+		{
+			Envelope->SetObjectField(TEXT("result"), ParsedResult);
+		}
+	}
+
+	FString Line;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Line);
+	FJsonSerializer::Serialize(Envelope.ToSharedRef(), Writer);
+
+	LoopObservations.Add(FLLMChatMessage{TEXT("user"), FString::Printf(TEXT("[观察] %s"), *Line)});
+	while (LoopObservations.Num() > 4)
+	{
+		LoopObservations.RemoveAt(0);
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[LLM] observation step=%d %s"), ToolStepCount, *Line);
+
+	// 延后一拍再请求：避免在行为层的 Broadcast 调用栈里递归发 HTTP。
+	TWeakObjectPtr<UAIBrainComponent> WeakThis(this);
+	AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+	{
+		if (!WeakThis.IsValid())
+		{
+			return;
+		}
+
+		UAIBrainComponent* Self = WeakThis.Get();
+		if (!Self->bToolLoopActive)
+		{
+			return;
+		}
+
+		FString IssueError;
+		if (!Self->IssueRequest(IssueError))
+		{
+			UE_LOG(LogTemp, Error, TEXT("[LLM] continue failed: %s"), *IssueError);
+			Self->AbortToolLoop(TEXT("issue_failed"));
+		}
+	});
 }
 
 void UAIBrainComponent::TrimRecentTurns()
@@ -288,6 +467,9 @@ void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 		return;
 	}
 
+	ResetToolLoop();
+	bToolLoopActive = true;
+
 	ConversationMessages.Add(FLLMChatMessage{TEXT("user"), Trimmed});
 	RetryAttempts = 0;
 
@@ -334,12 +516,15 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	// system 只进请求体，不写入 ConversationMessages —— 历史里只留真正的对话。
 	{
 		FString SystemPrompt = BuildSystemPrompt(NPC_Persona);
-		if (!PendingOutcome.IsEmpty())
+
+		// 当前状态：模型必须知道"我现在在做什么"，否则会出现"嘴上说停了、实际还在巡逻"。
+		if (!CurrentStateHint.IsEmpty())
 		{
-			// 闭环：把行为层的执行结果告诉模型，它下一句就能回应"到没到"。
-			SystemPrompt += FString::Printf(TEXT("\n上一轮执行结果：%s\n"), *PendingOutcome);
-			PendingOutcome.Reset();
+			SystemPrompt += FString::Printf(
+				TEXT("\n当前状态：%s（玩家要求停止时，如果这里不是 idle，你必须调用 idle 工具）\n"),
+				*CurrentStateHint);
 		}
+
 		if (bIsRetry)
 		{
 			// 让重试成为"不同的请求"：原样重发等于重复同一个失败。
@@ -359,6 +544,16 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 		MsgObj->SetStringField(TEXT("content"), M.Content);
 		MsgArray.Add(MakeShared<FJsonValueObject>(MsgObj));
 	}
+
+	// 本轮的 [观察] 追加在最后（不写入历史），利于 prompt 前缀缓存命中。
+	for (const FLLMChatMessage& M : LoopObservations)
+	{
+		TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
+		MsgObj->SetStringField(TEXT("role"), M.Role);
+		MsgObj->SetStringField(TEXT("content"), M.Content);
+		MsgArray.Add(MakeShared<FJsonValueObject>(MsgObj));
+	}
+
 	Root->SetArrayField(TEXT("messages"), MsgArray);
 
 	FString Body;
@@ -502,17 +697,46 @@ void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponse
 	++StatOk;
 	RetryAttempts = 0;
 
-	UE_LOG(LogTemp, Warning, TEXT("[LLM] decision ok    action=%s speech=\"%s\" (finish=%s) ok=%d retry=%d fail=%d"),
-		*ActionToId(Decision.Action), *Decision.Speech, *FinishReason, StatOk, StatRetry, StatFail);
-	
-	ConversationMessages.Add(FLLMChatMessage{TEXT("assistant"), Content});
-	TrimRecentTurns();
+	// ---- final_answer：本轮结束 ----
+	if (Decision.bFinalAnswer)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[LLM] final_answer steps=%d speech=\"%s\" (finish=%s) ok=%d retry=%d fail=%d"),
+			ToolStepCount, *Decision.Speech, *FinishReason, StatOk, StatRetry, StatFail);
 
-	// M1-4：先给行为层（控制器写黑板），再给 UI（蓝图里的打印）。
-	// 两者都在游戏线程，直接广播即可，不必再走 BroadcastOnGameThread。
+		ConversationMessages.Add(FLLMChatMessage{TEXT("assistant"), Content});
+		TrimRecentTurns();
+		ResetToolLoop();
+
+		BroadcastOnGameThread(true, Decision.Speech);
+		return;
+	}
+
+	// ---- tool_call：占一步，交给行为层执行 ----
+	++ToolStepCount;
+
+	UE_LOG(LogTemp, Warning, TEXT("[LLM] tool_call step=%d tool=%s target=\"%s\""),
+		ToolStepCount, *Decision.ToolId, *Decision.Target);
+
+	if (ToolStepCount > MaxToolSteps)
+	{
+		AbortToolLoop(TEXT("step_limit"));
+		return;
+	}
+
+	// 原地打转检测：同一工具 + 同一参数连续两次 -> 直接中止。
+	const FString Signature = FString::Printf(TEXT("%s|%s"), *Decision.ToolId, *Decision.Target);
+	if (!LastToolSignature.IsEmpty() && Signature == LastToolSignature)
+	{
+		AbortToolLoop(TEXT("repeated_call"));
+		return;
+	}
+	LastToolSignature = Signature;
+
+	// 中间轮的工具调用 JSON 不写进历史：保持"一次玩家指令 = 一对 user/assistant"。
+	ToolStartedAt = FPlatformTime::Seconds();
+	bAwaitingToolResult = true;
+
 	OnNPCDecision.Broadcast(Decision);
-
-	BroadcastOnGameThread(true, Decision.Speech);
 }
 
 void UAIBrainComponent::HandleDecisionFailure(const FString& Reason, const FString& RawContent, const FString& FinishReason)

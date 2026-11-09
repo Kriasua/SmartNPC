@@ -22,31 +22,66 @@ struct FLLMChatMessage
 	FString Content;
 };
 
-/** 行为树顶层的状态。LLM 只负责"进入哪个状态"，具体怎么执行由行为树决定。 */
-UENUM(BlueprintType)
-enum class ENPCAction : uint8
-{
-	None    UMETA(DisplayName = "None"),
-	Follow  UMETA(DisplayName = "Follow"),
-	Patrol  UMETA(DisplayName = "Patrol"),
-	Combat  UMETA(DisplayName = "Combat"),
-};
-
-/** M1-2: 一次决策的解析结果。M1-4 起随 OnNPCDecision 广播给行为层。 */
+/**
+ * 模型这一轮要说的话 / 要做的工具调用。
+ *
+ * 协议（每轮一个 JSON）：
+ *   {"type":"final_answer","text":"喵，到了。"}
+ *   {"type":"tool_call","tool":"query_world"}
+ *   {"type":"tool_call","tool":"move_to","args":{"target":"actor:3"}}
+ *   {"type":"tool_call","tool":"follow"}
+ */
 USTRUCT(BlueprintType)
 struct FNPCDecision
 {
 	GENERATED_BODY()
 
+	/** true = 说完就结束本轮；false = 要执行一个工具，执行完再来一轮。 */
 	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
-	ENPCAction Action = ENPCAction::None;
+	bool bFinalAnswer = false;
 
-	/** 猫要说的话。任何 action 下都可能是空串（只执行、不说话）。 */
+	/** 工具 id（follow / patrol / combat / query_world / move_to）。 */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString ToolId;
+
+	/** move_to 的目标 id（player:0 或 actor:N）。 */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString Target;
+
+	/** 台词（final_answer 的 text）。 */
 	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
 	FString Speech;
 };
 
-/** M1-4：通过校验的决策出口。控制器订阅它去写黑板。 */
+/** 工具执行结果。由行为层填写，组件负责补上 step / elapsed_ms 并组装成观察 JSON。 */
+USTRUCT(BlueprintType)
+struct FToolResult
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString ToolId;
+
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	bool bOk = true;
+
+	/** Succeeded / Failed / Rejected / TimedOut */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString Status = TEXT("Succeeded");
+
+	/** 成功时的载荷（一段 JSON 对象文本，可为空）。 */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString ResultJson;
+
+	/** 失败时的封闭错误码：unknown_tool / bad_args / no_target / target_not_found / ... */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString ErrorCode;
+
+	/** 失败时给模型的一句中文提示，告诉它下一步怎么改。 */
+	UPROPERTY(BlueprintReadOnly, Category = "AI_System|LLM")
+	FString ErrorHint;
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnNPCDecision, FNPCDecision, Decision);
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
@@ -61,8 +96,7 @@ public:
 	FString NPC_Name = TEXT("NPC_01");
 
 	/** OpenAI-compatible base URL (no trailing /chat/completions).
-	 *  DeepSeek default; the previous Qwen value was
-	 *  https://dashscope.aliyuncs.com/compatible-mode/v1. */
+	 *  DeepSeek default; local servers (Ollama / llama.cpp) work the same way. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
 	FString LLM_BaseUrl = TEXT("https://api.deepseek.com");
 
@@ -82,7 +116,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM", meta = (ClampMin = "1"))
 	int32 MaxTurns = 8;
 
-	/** 角色的自我设定。只影响语气/口吻，不影响能力清单（能力由代码里的动作表决定）。 */
+	/** 一条玩家指令最多允许执行几个工具（ReAct 循环上限）。3 = 查询 → 行动 → 回答。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM", meta = (ClampMin = "1", ClampMax = "6"))
+	int32 MaxToolSteps = 3;
+
+	/** 角色的自我设定。只影响语气/口吻，不影响能力清单（能力由动作注册表决定）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
 	FString NPC_Persona = TEXT("你是一只蒸汽朋克机械猫，住在老工厂里。用第一人称、简短口语回答，最多 40 字。");
 
@@ -102,25 +140,34 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "AI_System|LLM")
 	FOnLLMChatFinished OnLLMChatFinished;
 
-	/** M1-4：结构化决策出口。旧的 OnLLMChatFinished 保持不变，蓝图无需改动。 */
+	/** 结构化决策出口：控制器订阅它去执行工具。 */
 	UPROPERTY(BlueprintAssignable, Category = "AI_System|LLM")
 	FOnNPCDecision OnNPCDecision;
 
 	UFUNCTION(BlueprintCallable, Category = "AI_System")
 	void TestAILogic();
 
-	/** Appends the user message, POSTs to an OpenAI-compatible chat/completions (DeepSeek by
-	 *  default); on failure the user turn is popped again. */
+	/** 玩家说一句话 -> 开始一轮（可能包含多次工具调用的）循环。 */
 	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
 	void SendRequestToLLM(const FString& UserMessage);
 
 	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
 	void ClearLLMConversation();
 
-	/** 行为层回填的执行结果（"move_to 完成（用时 3.2 秒）"）。
-	 *  会拼进**下一次**请求的 system prompt，让模型知道自己上一句有没有办成；用完即清空。 */
+	/** 行为层回填工具执行结果；组件会把它变成一条 [观察] 消息并继续下一轮。
+	 *  这是 ReAct 循环的"反馈"入口。 */
 	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
-	void SetLastOutcome(const FString& InOutcome);
+	void ReportToolResult(const FToolResult& Result);
+
+	/** 行为层回填"当前处于什么状态"（patrol / follow / combat / idle）。
+	 *  会拼进**每次**请求的 system prompt —— 否则模型只能靠猜，容易出现
+	 *  "嘴上说停了、实际还在巡逻"的错位。 */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
+	void SetCurrentStateHint(const FString& InState);
+
+	/** 当前是否有循环在进行（行为层用于判断要不要上报）。 */
+	UFUNCTION(BlueprintPure, Category = "AI_System|LLM")
+	bool IsToolLoopActive() const;
 
 	/** Resolves the key for each request, in order: SMARTNPC_LLM_API_KEY / DEEPSEEK_API_KEY
 	 *  (legacy DASHSCOPE_API_KEY last) environment variable -> gitignored
@@ -148,25 +195,52 @@ private:
 	void TrimRecentTurns();
 	void BroadcastOnGameThread(bool bSuccess, const FString& Message);
 
-	/** 用当前 ConversationMessages 组包并发请求（不含"添加 user 轮"）。重试复用它。
-	 *  bIsRetry 为 true 时会在 system prompt 末尾追加一句提醒，让重试成为"不同的请求"。 */
+	/** 用当前 ConversationMessages + 本轮观察组包并发请求（不含"添加 user 轮"）。 */
 	bool IssueRequest(FString& OutError, bool bIsRetry = false);
 
-	/** 决策失败的唯一出口：先重试，重试用尽才弹回 user 轮、广播失败、计数。 */
+	/** 请求失败（传输层 / 解析失败）的唯一出口：先重试，用完才弹回 user 轮、广播失败。 */
 	void HandleDecisionFailure(const FString& Reason, const FString& RawContent, const FString& FinishReason);
 
+	/** 结束本轮循环：清空观察与计数。 */
+	void ResetToolLoop();
+
+	/** 循环异常终止（步数用尽 / 重复调用），给玩家一句兜底台词。 */
+	void AbortToolLoop(const TCHAR* Reason);
+
+	/** 把一次工具结果包装成 [观察] 消息，然后继续下一轮。 */
+	void PushObservationAndContinue(const FToolResult& Result);
+
 	TArray<FLLMChatMessage> ConversationMessages;
+
+	/** 本轮循环内产生的 [观察] 消息；**不写入** ConversationMessages，循环结束即丢弃。 */
+	TArray<FLLMChatMessage> LoopObservations;
+
 	TSharedPtr<IHttpRequest> PendingLLMRequest;
 	bool bLLMRequestInFlight = false;
 
 	/** 当前这次请求已经重试过几次；成功或发起新请求时归零。 */
 	int32 RetryAttempts = 0;
 
+	/** 本轮已经执行了几个工具。 */
+	int32 ToolStepCount = 0;
+
+	/** 是否有循环在进行。 */
+	bool bToolLoopActive = false;
+
+	/** 已广播工具、正在等行为层回填结果（防止重复上报）。 */
+	bool bAwaitingToolResult = false;
+
+	/** 上一次工具调用签名（tool + 参数），用于检测原地打转。 */
+	FString LastToolSignature;
+
+	/** 当前行为状态（由行为层回填），每次请求都会拼进 system prompt。 */
+	FString CurrentStateHint;
+
+	/** 本次工具开始时间（秒），用于 elapsed_ms。 */
+	double ToolStartedAt = 0.0;
+
 	/** 会话级统计（先只进日志，M2 再做导出）。 */
 	int32 StatOk = 0;
 	int32 StatRetry = 0;
 	int32 StatFail = 0;
-
-	/** 待回填给模型的执行结果，只生效一次。 */
-	FString PendingOutcome;
 };

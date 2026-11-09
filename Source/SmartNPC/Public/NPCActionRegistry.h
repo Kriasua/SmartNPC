@@ -3,44 +3,55 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "AIBrainComponent.h"   // ENPCAction / FNPCDecision
+#include "AIBrainComponent.h"   // FNPCDecision
 
 class AAIController;
 class UBlackboardComponent;
 
+/** 工具的执行方式。 */
+enum class EToolKind : uint8
+{
+	/** 立即完成：只写黑板（follow / patrol / combat）。 */
+	InstantState,
+
+	/** 立即完成：只读世界，返回一段 JSON（query_world）。 */
+	Query,
+
+	/** 交给行为树执行，完成后由 BT 上报（move_to）。 */
+	BlockingBT,
+};
+
 /**
- * 动作的运行期定义。
+ * 一个工具的运行期定义。
  *
- * 这里的"动作"其实是**状态切换**：follow / patrol / combat 都是行为树顶层的
- * NPCBehaviour 枚举值，LLM 只决定"进入哪个状态"，具体怎么执行由行为树负责。
- *
- * 提示词、白名单校验、执行共用这一张表 —— 加一个状态 = 在这里加一行
- * （再在控制器里实现它的 Apply）。这样可以避免"模型会说、引擎不认"的漂移。
+ * 提示词、白名单、执行共用这一张表 —— 加一个工具 = 在这里加一行
+ * （再在控制器里实现它的 Apply）。这样不会出现"模型会说、引擎不认"的漂移。
  */
 struct FActionRuntime
 {
-	ENPCAction Action = ENPCAction::None;
+	/** 给模型看的工具 id，例如 "move_to"。 */
+	FString Id;
 
-	/** 给模型看的 id，例如 "follow"。 */
-	const TCHAR* Id = TEXT("");
+	/** 一句话说明，写进 system prompt。 */
+	FString PromptHint;
 
-	/** 写进 system prompt 的用法说明。 */
-	const TCHAR* PromptHint = TEXT("");
+	/** args 的字段说明，写进 system prompt（例如 "{target: 目标 id}"）。 */
+	FString ArgsHint;
 
-	/** 执行：写黑板。返回 false 表示这次执行失败（例如找不到玩家）。 */
+	EToolKind Kind = EToolKind::InstantState;
+
+	/** 执行：写黑板 / 读世界 / 启动 BT 动作。返回 false 表示这次执行失败。 */
 	TFunction<bool(AAIController&, UBlackboardComponent&, const FNPCDecision&)> Apply;
 };
 
-/** 唯一的动作注册表。函数内静态，避免跨编译单元的初始化顺序问题。 */
+/** 唯一的工具注册表。函数内静态，避免跨编译单元的初始化顺序问题。 */
 const TArray<FActionRuntime>& GetActionRuntimes();
 
-const FActionRuntime* FindActionRuntime(ENPCAction Action);
+/** 按 id 查工具（大小写不敏感），找不到返回 nullptr。 */
+const FActionRuntime* FindActionRuntimeById(const FString& Id);
 
-/** 模型返回的字符串 id -> 枚举（大小写不敏感）。失败返回 false。 */
-bool TryParseActionId(const FString& Id, ENPCAction& OutAction);
-
-/** 枚举 -> 字符串 id，用于日志。 */
-FString ActionToId(ENPCAction Action);
-
-/** 由注册表生成 system prompt 里的能力清单。 */
+/** 由注册表生成 system prompt 里的工具清单。 */
 FString BuildActionPromptLines();
+
+/** 所有可用工具 id，用于错误提示（"可用工具：..."）。 */
+FString BuildAvailableToolsHint();
