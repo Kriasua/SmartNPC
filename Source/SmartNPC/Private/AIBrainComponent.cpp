@@ -66,7 +66,9 @@ FString BuildSystemPrompt(const FString& Persona)
 		TEXT("7. 玩家要求你做不到的事（吃饭、睡觉之类），直接用 final_answer 说明做不到，不要调用工具。\n")
 		TEXT("8. 即使看不懂玩家的话，也必须输出一个 JSON 对象，不能返回空内容。\n")
 		TEXT("9. 玩家让你停下、别打了、住手、等着时，用 idle 工具原地停住。"
-			"只有当\"当前状态\"已经是 idle 时，才可以直接用 final_answer 回应；否则必须调工具。\n\n")
+			"只有当\"当前状态\"已经是 idle 时，才可以直接用 final_answer 回应；否则必须调工具。\n")
+		TEXT("10. 绝不能在没有调用工具的情况下声称完成了动作。玩家让你去某处、做某事时，"
+			"本轮必须至少调用一次工具；复合命令（先 A 再 B）要逐个调用 move_to。\n\n")
 		TEXT("示例一（直接回答）：\n")
 		TEXT("玩家：你好呀\n")
 		TEXT("{\"type\":\"final_answer\",\"text\":\"喵，你好。齿轮今天转得不错。\"}\n\n")
@@ -445,6 +447,81 @@ bool UAIBrainComponent::HasLLMAPIKey() const
 	return !GetLLMAPIKey().IsEmpty();
 }
 
+void UAIBrainComponent::RecordUsage(const TSharedPtr<FJsonObject>& Response)
+{
+	const TSharedPtr<FJsonObject>* UsagePtr = nullptr;
+	if (!Response.IsValid()
+		|| !Response->TryGetObjectField(TEXT("usage"), UsagePtr)
+		|| !UsagePtr || !(*UsagePtr).IsValid())
+	{
+		return;
+	}
+
+	double PromptTokens = 0.0;
+	double CompletionTokens = 0.0;
+	double HitTokens = 0.0;
+	double MissTokens = 0.0;
+
+	(*UsagePtr)->TryGetNumberField(TEXT("prompt_tokens"), PromptTokens);
+	(*UsagePtr)->TryGetNumberField(TEXT("completion_tokens"), CompletionTokens);
+
+	// DeepSeek 会给出缓存命中/未命中明细；用按位或保证两边都尝试解析。
+	const bool bHasCacheDetail =
+		(*UsagePtr)->TryGetNumberField(TEXT("prompt_cache_hit_tokens"), HitTokens)
+		| (*UsagePtr)->TryGetNumberField(TEXT("prompt_cache_miss_tokens"), MissTokens);
+
+	if (!bHasCacheDetail)
+	{
+		// 没有明细就按"全部未命中"计——宁可高估，不低估费用。
+		MissTokens = PromptTokens;
+	}
+
+	const double RequestCost =
+		(HitTokens / 1000000.0) * PriceInputHitPerM +
+		(MissTokens / 1000000.0) * PriceInputMissPerM +
+		(CompletionTokens / 1000000.0) * PriceOutputPerM;
+
+	SessionRequestCount += 1;
+	SessionPromptTokens += FMath::RoundToInt(PromptTokens);
+	SessionCompletionTokens += FMath::RoundToInt(CompletionTokens);
+	SessionCacheHitTokens += FMath::RoundToInt(HitTokens);
+	SessionCacheMissTokens += FMath::RoundToInt(MissTokens);
+	SessionCostYuan += RequestCost;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("[Cost] in=%.0f (hit=%.0f miss=%.0f) out=%.0f | 本次 %.6f 元 | 累计 %d 次 %.0f tokens %.6f 元"),
+		PromptTokens, HitTokens, MissTokens, CompletionTokens, RequestCost,
+		SessionRequestCount,
+		static_cast<double>(SessionPromptTokens + SessionCompletionTokens),
+		SessionCostYuan);
+}
+
+double UAIBrainComponent::GetSessionCostYuan() const
+{
+	return SessionCostYuan;
+}
+
+int32 UAIBrainComponent::GetSessionTotalTokens() const
+{
+	return SessionPromptTokens + SessionCompletionTokens;
+}
+
+int32 UAIBrainComponent::GetSessionRequestCount() const
+{
+	return SessionRequestCount;
+}
+
+FString UAIBrainComponent::GetTokenStatsSummary() const
+{
+	const double AvgCost = SessionRequestCount > 0 ? SessionCostYuan / SessionRequestCount : 0.0;
+
+	return FString::Printf(
+		TEXT("requests=%d tokens=%d (in=%d hit=%d miss=%d out=%d) cost=%.6f 元 avg=%.6f 元/次"),
+		SessionRequestCount, GetSessionTotalTokens(),
+		SessionPromptTokens, SessionCacheHitTokens, SessionCacheMissTokens, SessionCompletionTokens,
+		SessionCostYuan, AvgCost);
+}
+
 void UAIBrainComponent::SendRequestToLLM(const FString& UserMessage)
 {
 	const FString Trimmed = UserMessage.TrimStartAndEnd();
@@ -503,6 +580,9 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	}
 	Root->SetNumberField(TEXT("max_tokens"), MaxOutputTokens);
 
+	// 采样温度：benchmark 用 0（可复现），演示可调到 0.7（台词自然）。
+	Root->SetNumberField(TEXT("temperature"), Temperature);
+
 	// NPC 对话不需要思考过程：关掉更快也更省，同时是以后升级到 strict tool calls 的前提。
 	{
 		TSharedPtr<FJsonObject> Thinking = MakeShared<FJsonObject>();
@@ -524,6 +604,11 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 				TEXT("\n当前状态：%s（玩家要求停止时，如果这里不是 idle，你必须调用 idle 工具）\n"),
 				*CurrentStateHint);
 		}
+
+		// 本轮已执行工具数：堵死"没动手却说完成了"（verbal compliance）。
+		SystemPrompt += FString::Printf(
+			TEXT("本轮已执行工具：%d 次（如果这条指令需要移动或切换状态，你必须先调用工具，不能直接声称完成）\n"),
+			ToolStepCount);
 
 		if (bIsRetry)
 		{
@@ -645,9 +730,11 @@ void UAIBrainComponent::OnLLMHttpComplete(FHttpRequestPtr Request, FHttpResponse
 		return;
 	}
 
+	// 计费：先把 usage 记账 —— 无论后面的内容解析成不成功，这些 token 都已经花掉了。
+	RecordUsage(JsonParsed);
+
 	const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
-	if (!JsonParsed->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)
-	{
+	if (!JsonParsed->TryGetArrayField(TEXT("choices"), Choices) || !Choices || Choices->Num() == 0)	{
 		PopLastUserIfNeeded();
 		BroadcastOnGameThread(false, TEXT("Response has no choices."));
 		return;
@@ -768,6 +855,9 @@ void UAIBrainComponent::HandleDecisionFailure(const FString& Reason, const FStri
 	{
 		ConversationMessages.Pop(EAllowShrinking::No);
 	}
+
+	// 失败也是一轮的结束：必须清掉循环状态，否则外部（AIBench / UI）会一直以为还在跑。
+	ResetToolLoop();
 
 	UE_LOG(LogTemp, Error, TEXT("[LLM] decision FAIL  reason=%s (finish=%s) raw=\"%s\" ok=%d retry=%d fail=%d"),
 		*FinalReason, *FinishReason, *RawSnippet, StatOk, StatRetry, StatFail);

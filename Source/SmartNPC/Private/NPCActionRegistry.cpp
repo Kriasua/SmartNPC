@@ -66,7 +66,8 @@ const TArray<FActionRuntime>& GetActionRuntimes()
 		},
 		{
 			TEXT("combat"),
-			TEXT("进入战斗状态：追击并开火，不需要目标参数。"),
+			TEXT("进入战斗状态，追击并开火。玩家说 fight / 打 / 开打 / 干架 / 挑衅你时用它——"
+				"不要只是口头回应\"真要打？\"，必须真的切换状态。"),
 			TEXT("无参数"),
 			EToolKind::InstantState,
 			[](AAIController& Controller, UBlackboardComponent& BlackboardComp, const FNPCDecision& Decision)

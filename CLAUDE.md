@@ -72,7 +72,8 @@ commit. `git add` is only part of an already-approved commit.
   Guards: `bToolLoopActive` / `bAwaitingToolResult` make stray reports free (no API call);
   identical consecutive `tool|args` aborts the loop; exceeding the step budget aborts it too.
   The system prompt also carries **`当前状态：<state>`** (pushed by the controller through
-  `SetCurrentStateHint()`), because without it the model happily claims "I stopped" while patrolling.
+  `SetCurrentStateHint()`) and **`本轮已执行工具：N 次`**, because without them the model happily
+  claims "I stopped" / "I went there" without doing anything (verbal compliance).
   Failures retry once with a nudge, then fall back to a visible error. No streaming. Valid decisions
   leave through `OnNPCDecision` (structured) and `OnLLMChatFinished` (speech text). The key is
   resolved per request by `GetLLMAPIKey()` (env var → gitignored ini → `SetLLMAPIKey()`), never from a

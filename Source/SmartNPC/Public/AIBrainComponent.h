@@ -128,9 +128,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM", meta = (ClampMin = "64", ClampMax = "4096"))
 	int32 MaxOutputTokens = 512;
 
+	/** 采样温度。0 = 近乎确定（跑 benchmark / 做 A-B 对比必须用 0）；0.7 左右台词更自然。
+	 *  注意 0 也不等于绝对确定：GPU 浮点累加顺序不固定，同一 prompt 仍可能偶尔不同。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float Temperature = 0.0f;
+
 	/** 空内容 / 解析失败时自动重发的次数上限（0 = 不重试）。HTTP 层错误不重试，重试也没用。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM", meta = (ClampMin = "0", ClampMax = "3"))
 	int32 MaxRetries = 1;
+
+	// ---- 计费单价（元 / 百万 tokens）----
+	// 默认值取官方 deepseek-flash（DeepSeek-V4.1-Flash-1017）**高峰时段**价格；
+	// 空闲时段（工作日 9-12、14-18 之外，及周末假日）约为其一半。
+	// 官方页：https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|Cost")
+	float PriceInputHitPerM = 0.04f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|Cost")
+	float PriceInputMissPerM = 2.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|Cost")
+	float PriceOutputPerM = 8.0f;
 
 	/** 是否向 API 请求 JSON Output（response_format=json_object）。
 	 *  A/B 开关：关掉时完全靠 system prompt 约束 + ParseDecision 的容错解析。 */
@@ -182,6 +200,21 @@ public:
 	/** True when GetLLMAPIKey() would return something. Useful for gating calls from Blueprint. */
 	UFUNCTION(BlueprintCallable, Category = "AI_System|LLM")
 	bool HasLLMAPIKey() const;
+
+	/** 本次会话累计花费（元）。M2-2 量化用。 */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|Cost")
+	double GetSessionCostYuan() const;
+
+	/** 本次会话累计 tokens（输入 + 输出）。 */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|Cost")
+	int32 GetSessionTotalTokens() const;
+
+	UFUNCTION(BlueprintCallable, Category = "AI_System|Cost")
+	int32 GetSessionRequestCount() const;
+
+	/** 一行人类可读的统计，控制台/日志用。 */
+	UFUNCTION(BlueprintCallable, Category = "AI_System|Cost")
+	FString GetTokenStatsSummary() const;
 
 protected:
 	virtual void BeginPlay() override;
@@ -239,8 +272,19 @@ private:
 	/** 本次工具开始时间（秒），用于 elapsed_ms。 */
 	double ToolStartedAt = 0.0;
 
+	/** 从响应里读 usage 并累加 token / 费用（无论后续解析成功与否，钱已经花了）。 */
+	void RecordUsage(const TSharedPtr<FJsonObject>& Response);
+
 	/** 会话级统计（先只进日志，M2 再做导出）。 */
 	int32 StatOk = 0;
 	int32 StatRetry = 0;
 	int32 StatFail = 0;
+
+	// ---- 计费统计 ----
+	int32 SessionRequestCount = 0;
+	int32 SessionPromptTokens = 0;
+	int32 SessionCompletionTokens = 0;
+	int32 SessionCacheHitTokens = 0;
+	int32 SessionCacheMissTokens = 0;
+	double SessionCostYuan = 0.0;
 };
