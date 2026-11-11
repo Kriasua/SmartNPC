@@ -68,7 +68,9 @@ FString BuildSystemPrompt(const FString& Persona)
 		TEXT("9. 玩家让你停下、别打了、住手、等着时，用 idle 工具原地停住。"
 			"只有当\"当前状态\"已经是 idle 时，才可以直接用 final_answer 回应；否则必须调工具。\n")
 		TEXT("10. 绝不能在没有调用工具的情况下声称完成了动作。玩家让你去某处、做某事时，"
-			"本轮必须至少调用一次工具；复合命令（先 A 再 B）要逐个调用 move_to。\n\n")
+			"本轮必须至少调用一次工具；复合命令（先 A 再 B）要逐个调用 move_to。\n")
+		// 本地小模型（如 Qwen3-8B）会跟着玩家的语言漂移，实测中文指令会答成英文台词。
+		TEXT("11. 无论玩家用什么语言说话，台词一律用中文回答。\n\n")
 		TEXT("示例一（直接回答）：\n")
 		TEXT("玩家：你好呀\n")
 		TEXT("{\"type\":\"final_answer\",\"text\":\"喵，你好。齿轮今天转得不错。\"}\n\n")
@@ -220,6 +222,39 @@ UAIBrainComponent::UAIBrainComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 }
+
+void UAIBrainComponent::ApplyProviderDefaults()
+{
+	switch (Provider)
+	{
+	case ELLMProvider::LocalQwen:
+		LLM_BaseUrl = TEXT("http://localhost:11434/v1");
+		LLM_Model = TEXT("qwen3:8b");
+		bUseJSONResponseFormat = false;   // Ollama 未必支持 response_format
+		bSendThinkingField = false;       // thinking 是 DeepSeek 专有字段
+		break;
+
+	case ELLMProvider::DeepSeek:
+	default:
+		LLM_BaseUrl = TEXT("https://api.deepseek.com");
+		LLM_Model = TEXT("deepseek-flash");
+		bUseJSONResponseFormat = true;
+		bSendThinkingField = true;
+		break;
+	}
+}
+
+#if WITH_EDITOR
+void UAIBrainComponent::PostEditChangeProperty(FPropertyChangedEvent& Event)
+{
+	Super::PostEditChangeProperty(Event);
+
+	if (Event.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UAIBrainComponent, Provider))
+	{
+		ApplyProviderDefaults();
+	}
+}
+#endif
 
 void UAIBrainComponent::BeginPlay()
 {
@@ -568,11 +603,24 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetStringField(TEXT("model"), LLM_Model);
+
+	// Provider 是唯一权威：选本地就用 LocalBaseUrl / LocalModel，无视上面那两栏（它们常被旧值粘住）。
+	const bool bLocal = (Provider == ELLMProvider::LocalQwen);
+	const FString EffectiveBaseUrl = bLocal ? LocalBaseUrl : LLM_BaseUrl;
+	const FString EffectiveModel = bLocal ? LocalModel : LLM_Model;
+
+	Root->SetStringField(TEXT("model"), EffectiveModel);
 	Root->SetBoolField(TEXT("stream"), false);
 
-	// JSON Output 只保证"语法合法"，语义仍由 ParseDecision 校验；可用开关做 A/B。
-	if (bUseJSONResponseFormat)
+	UE_LOG(LogTemp, Warning, TEXT("[LLM] request -> %s model=%s (provider=%s)"),
+		*EffectiveBaseUrl, *EffectiveModel, bLocal ? TEXT("LocalQwen") : TEXT("DeepSeek"));
+
+	// 注意：不要给 Ollama 的 /v1 端点发 `think` 字段 —— 它会被当成提示词标记塞进消息里
+	// （实测 "say hi" 变成 "say hi /think"），反而让模型继续思考、content 留空。
+	// 本地模型的思考开销由 MaxOutputTokens 兜住：思考先吃 token，之后才是 content。
+
+	// 本地服务器只保证基础对话，JSON Output 与 thinking 都只在云端发。
+	if (bUseJSONResponseFormat && !bLocal)
 	{
 		TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
 		ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
@@ -584,6 +632,8 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	Root->SetNumberField(TEXT("temperature"), Temperature);
 
 	// NPC 对话不需要思考过程：关掉更快也更省，同时是以后升级到 strict tool calls 的前提。
+	// 本地服务器（Ollama）不认识这个字段，由 bSendThinkingField 控制是否发送。
+	if (bSendThinkingField && !bLocal)
 	{
 		TSharedPtr<FJsonObject> Thinking = MakeShared<FJsonObject>();
 		Thinking->SetStringField(TEXT("type"), TEXT("disabled"));
@@ -659,7 +709,7 @@ bool UAIBrainComponent::IssueRequest(FString& OutError, bool bIsRetry)
 	TSharedRef<IHttpRequest> Req = HttpModule.CreateRequest();
 	PendingLLMRequest = Req;
 	Req->SetVerb(TEXT("POST"));
-	Req->SetURL(BuildChatCompletionsUrl(LLM_BaseUrl));
+	Req->SetURL(BuildChatCompletionsUrl(EffectiveBaseUrl));
 	Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Req->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *APIKey));
 	Req->SetContentAsString(Body);

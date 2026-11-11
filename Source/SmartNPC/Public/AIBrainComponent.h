@@ -10,6 +10,14 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnLLMChatFinished, bool, bSuccess, FString, Message);
 
+/** 模型来源。选中后会自动套用该来源的 BaseUrl / 模型名 / JSON 模式等默认值。 */
+UENUM(BlueprintType)
+enum class ELLMProvider : uint8
+{
+	DeepSeek   UMETA(DisplayName = "DeepSeek (cloud)"),
+	LocalQwen  UMETA(DisplayName = "Local Qwen (Ollama)"),
+};
+
 USTRUCT(BlueprintType)
 struct FLLMChatMessage
 {
@@ -94,6 +102,21 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System")
 	FString NPC_Name = TEXT("NPC_01");
+
+	/** 选择模型来源；改动它会自动填好下面的 BaseUrl / 模型名 / 开关。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
+	ELLMProvider Provider = ELLMProvider::DeepSeek;
+
+	/** 是否发送 DeepSeek 专有的 `thinking` 字段。本地服务器（Ollama）请关掉，否则可能 400。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
+	bool bSendThinkingField = true;
+
+	/** 本地模型（Ollama）的端点与模型名。Provider 选 LocalQwen 时生效，不再看上面的 BaseUrl。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
+	FString LocalBaseUrl = TEXT("http://localhost:11434/v1");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AI_System|LLM")
+	FString LocalModel = TEXT("qwen3:8b");
 
 	/** OpenAI-compatible base URL (no trailing /chat/completions).
 	 *  DeepSeek default; local servers (Ollama / llama.cpp) work the same way. */
@@ -219,6 +242,14 @@ public:
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& Event) override;
+#endif
+
+private:
+	/** 按 Provider 套用该来源的默认连接参数。 */
+	void ApplyProviderDefaults();
 
 public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;

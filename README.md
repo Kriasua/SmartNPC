@@ -98,3 +98,41 @@ UE 5.6 · C++ · Behavior Tree · Blackboard · AI Perception · NavMesh
 3. **多智能体**：NPC 之间互相感知、对话与协作
 4. **工具链**：数据驱动配置 NPC 性格（让非程序员也能调教）
 5. **性能**：LLM 调用异步队列 / 节流 / 缓存 / 按距离分级思考
+
+## 本地模型部署评估（Ollama + Qwen3-8B）
+
+项目支持一键切换云端 / 本地模型：`AIBrainComponent` 上的 `Provider` 下拉菜单（`DeepSeek (cloud)` /
+`Local Qwen (Ollama)`），选中后由 `Local Base Url` + `Local Model` 决定实际端点，运行时以
+`Provider` 为唯一权威。切换后每次请求都会打印一行可核对的日志：
+
+```
+[LLM] request -> http://localhost:11434/v1 model=qwen3-8b:latest (provider=LocalQwen)
+```
+
+**实测结果（12 GB 显存开发机，UE 编辑器 + PIE 同时运行）**
+
+| 指标 | DeepSeek 云端 | 本地 Qwen3-8B |
+|---|---|---|
+| 单次决策延迟 | 1.0 - 1.25 s | **270 s** |
+| 输出吞吐 | - | **0.44 token/s** |
+| 单条指令成本 | 约 0.0016 元 | 电费（可忽略） |
+| 协议遵从 | 100% | **格式正确**（`{"type":"final_answer",...}`） |
+| 缓存命中 | 约 69% | 不适用（无缓存字段） |
+
+**结论**：瓶颈不在架构，也不在模型能力。8B 模型约需 5-6 GB 显存，与编辑器争抢后 Ollama 退化为
+CPU 推理（0.44 token/s，对比 GPU 常规 30-50 token/s），单次决策 270 秒，**不具备实时性**。
+模型本身能正确输出协议 JSON —— 说明"工具白名单 + 严格 JSON"的设计并不依赖大模型规模。
+
+**两个实测踩到的坑**
+
+1. `think: false` 不能发给 Ollama 的 `/v1` 端点：它会被拼进提示词（`"say hi"` 变成 `"say hi /think"`），
+   反而让模型继续思考、`content` 留空。思考开销应通过 `MaxOutputTokens` 兜住。
+2. Qwen3 默认开启思考模式，输出先写 `reasoning` 字段；若 `max_tokens` 太小，`content` 会是空串，
+   表现为"invalid response"。排查时应直接看响应原文，而不是猜网络问题。
+
+**复现脚本**：`Tools/qwen_probe.py` —— 复用 UE 相同的 system prompt 与题库，直接用 urllib 打本地端点，
+打印每次的延迟、`finish_reason`、`content` / `reasoning`，不依赖 Unreal。
+
+```powershell
+python Tools/qwen_probe.py --runs 3 --max-tokens 256
+```
